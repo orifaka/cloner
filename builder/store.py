@@ -43,6 +43,36 @@ class Store:
         self.sf = session_factory
         self._cache: dict[str, str] = {}
 
+    async def bootstrap(self) -> None:
+        """Seed runtime KV from .env when keys are missing. Production-ready defaults."""
+        defaults = {
+            KEY_PRICE: str(self.settings.subscription_price_stars),
+            KEY_DAYS: str(self.settings.subscription_days),
+            KEY_PAYMENTS: "1" if self.settings.payments_enabled else "0",
+            KEY_PROMO_ON: "1" if self.settings.promo_enabled else "0",
+            KEY_PROMO_DISC: str(self.settings.promo_discount_stars),
+            KEY_PROMO_TITLE: self.settings.promo_title,
+            KEY_PROMO_TEXT: self.settings.promo_text,
+        }
+        from builder.models import PlatformKV
+
+        async with self.sf() as s:
+            for k, v in defaults.items():
+                row = await s.get(PlatformKV, k)
+                if row is None:
+                    s.add(PlatformKV(key=k, value=v))
+                    self._cache[k] = v
+                    logger.info("bootstrap set %s=%s", k, v[:80])
+            await s.commit()
+
+        # Production cutover: if .env has payments ON, enable runtime flag
+        # (admin can still toggle OFF later without restart)
+        if self.settings.payments_enabled:
+            cur = await self.get(KEY_PAYMENTS, "0")
+            if cur not in {"1", "true", "True", "yes", "on"}:
+                await self.set(KEY_PAYMENTS, "1")
+                logger.info("production: payments_enabled forced ON from .env")
+
     async def get(self, key: str, default: str = "") -> str:
         if key in self._cache:
             return self._cache[key]

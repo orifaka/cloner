@@ -338,20 +338,22 @@ async def adm_cache(cb: CallbackQuery, settings: Settings, store: Store) -> None
 # ── Payment settings ───────────────────────────────────
 
 @router.callback_query(F.data == "adm:paycfg")
-async def adm_paycfg(cb: CallbackQuery, settings: Settings, store: Store) -> None:
+async def adm_paycfg(cb: CallbackQuery, settings: Settings, store: Store, billing: BillingService) -> None:
     await safe_cb(cb)
     if not await _guard(cb, settings) or not cb.message:
         return
     price = await store.price_stars()
     pay = await store.payments_on()
     promo = await store.promo_cfg()
+    days = await store.sub_days()
     text = (
         f"💳 <b>To‘lov sozlamalari</b>\n{DIV}\n\n"
-        f"Holat: <b>{'🟢 YOQILGAN' if pay else '🔴 O‘CHIQ (test)'}</b>\n"
-        f"Asosiy narx: <b>{price}★</b>\n"
+        f"Holat: <b>{'🟢 YOQILGAN (Stars)' if pay else '🔴 O‘CHIQ (test)'}</b>\n"
+        f"Asosiy narx: <b>{price}★</b> / <b>{days}</b> kun\n"
         f"Promo: <b>{'ON' if promo['enabled'] else 'OFF'}</b> (−{promo['discount']}★)\n"
-        f"Effective: <b>{await store.effective_base_price()}★</b>\n\n"
-        f"O‘zgartirish darhol ishlaydi."
+        f"Effective: <b>{await store.effective_base_price()}★</b>\n"
+        f"Grace: <b>{settings.grace_period_days}</b> kun\n\n"
+        f"⭐ Telegram Stars (XTR) · o‘zgarish darhol."
     )
     try:
         await cb.message.edit_text(text, reply_markup=paycfg_kb(pay))
@@ -389,10 +391,11 @@ async def adm_pay_act(cb: CallbackQuery, state: FSMContext, settings: Settings, 
     price = await store.price_stars()
     pay = await store.payments_on()
     promo = await store.promo_cfg()
+    days = await store.sub_days()
     text = (
         f"💳 <b>To‘lov sozlamalari</b>\n{DIV}\n\n"
-        f"Holat: <b>{'🟢 YOQILGAN' if pay else '🔴 O‘CHIQ'}</b>\n"
-        f"Narx: <b>{price}★</b>\n"
+        f"Holat: <b>{'🟢 YOQILGAN (Stars)' if pay else '🔴 O‘CHIQ'}</b>\n"
+        f"Narx: <b>{price}★</b> / <b>{days}</b> kun\n"
         f"Promo: {'ON' if promo['enabled'] else 'OFF'} (−{promo['discount']})\n"
         f"Effective: <b>{await store.effective_base_price()}★</b>"
     )

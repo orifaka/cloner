@@ -376,18 +376,35 @@ def settings_text(s: Settings, lang: str) -> str:
     )
 
 
-def payment_sent(s: Settings) -> str:
+def payment_sent(s: Settings, amount: int | None = None) -> str:
+    amt = f"\nSumma: <b>{amount}★</b>" if amount else ""
     return (
-        f"⭐ <b>Hisob-faktura yuborildi</b>\n\n"
+        f"⭐ <b>Hisob-faktura yuborildi</b>{amt}\n\n"
         f"Telegramda to‘lovni tasdiqlang.\n"
-        f"Chegirma bo‘lsa — summa kamaygan."
+        f"Chegirma / bonus bo‘lsa — summa kamaygan."
     )
 
 
-def payment_ok() -> str:
+def payment_ok(*, need_token: bool = True, free: bool = False) -> str:
+    head = "✅ <b>Bonus hisobdan yechildi!</b>" if free else "✅ <b>To‘lov qabul qilindi!</b>"
+    if need_token:
+        return (
+            f"{head}\n{DIV}\n\n"
+            f"Obuna faol.\n"
+            f"🔑 Token yuboring — deploy boshlanadi."
+        )
     return (
-        f"✅ <b>To‘lov qabul qilindi!</b>\n{DIV}\n\n"
-        f"Obuna faol. Token yuboring — deploy boshlanadi."
+        f"{head}\n{DIV}\n\n"
+        f"💎 Obuna uzaytirildi.\n"
+        f"Botingiz yana ishlashi mumkin."
+    )
+
+
+def payment_need_sub(price: int) -> str:
+    return (
+        f"💎 <b>Avval obuna kerak</b>\n{DIV}\n\n"
+        f"Bot ochish uchun {price}★ to‘lang.\n"
+        f"To‘lovdan so‘ng token so‘raladi."
     )
 
 

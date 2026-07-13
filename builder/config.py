@@ -32,7 +32,8 @@ class Settings(BaseSettings):
     # Immediate suspend on expiry; permanent purge after this many days
     grace_period_days: int = Field(default=7, alias="GRACE_PERIOD_DAYS")
     grace_period_hours: int = Field(default=168, alias="GRACE_PERIOD_HOURS")  # legacy alias (7d)
-    payments_enabled: bool = Field(default=False, alias="PAYMENTS_ENABLED")
+    # Production default: payments ON (override with PAYMENTS_ENABLED=false for local test)
+    payments_enabled: bool = Field(default=True, alias="PAYMENTS_ENABLED")
 
     # Limited-time offer banner
     promo_enabled: bool = Field(default=True, alias="PROMO_ENABLED")

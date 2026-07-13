@@ -29,6 +29,7 @@ from builder.copy import (
     friendly_error,
     help_text,
     intro,
+    payment_need_sub,
     payment_ok,
     payment_sent,
     payments_history,
@@ -82,16 +83,78 @@ def _exp_str(sub) -> str | None:
 
 # ── Home ───────────────────────────────────────────────
 
+async def _pay_on(billing: BillingService) -> bool:
+    try:
+        return await billing.payments_enabled()
+    except Exception:  # noqa: BLE001
+        return bool(billing.settings.payments_enabled)
+
+
+async def _checkout(
+    bot: Bot,
+    chat_id: int,
+    state: FSMContext,
+    billing: BillingService,
+    settings: Settings,
+    uid: int,
+    purpose: str = "new_subscription",
+    *,
+    ask_token_after: bool | None = None,
+) -> bool:
+    """
+    Start Stars checkout or free credit activation.
+    Returns True if subscription is now active (free path or already handled).
+    Returns False if invoice was sent (waiting for payment).
+    """
+    try:
+        res = await billing.start_checkout(uid, purpose=purpose)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("checkout")
+        await bot.send_message(chat_id, friendly_error(e), reply_markup=after_error_kb())
+        return False
+
+    if res.get("free"):
+        panel = await billing.get_panel(uid)
+        dep = panel.get("deployment")
+        need_token = ask_token_after if ask_token_after is not None else not bool(dep)
+        await bot.send_message(
+            chat_id,
+            payment_ok(need_token=need_token, free=True),
+            reply_markup=_menu(settings, uid),
+        )
+        if need_token:
+            sub = res.get("subscription")
+            await state.set_state(DeployStates.waiting_token)
+            await state.update_data(subscription_id=sub.id if sub else None, deploying=False)
+            await bot.send_message(chat_id, ask_token())
+        elif dep and dep.status == "suspended":
+            # caller may restore — flag in return path via panel
+            pass
+        return True
+
+    await billing.send_stars_invoice(
+        bot,
+        chat_id,
+        res["payload"],
+        amount=res["amount"],
+        days=res.get("days"),
+    )
+    await bot.send_message(chat_id, payment_sent(settings, amount=res["amount"]))
+    return False
+
+
 async def _send_intro(bot, chat_id: int, state: FSMContext, settings: Settings, uid: int, billing: BillingService | None = None) -> None:
     price = settings.effective_price
+    pay_on = settings.payments_enabled
     if billing:
         try:
             price, _ = await billing.get_price(uid)
+            pay_on = await _pay_on(billing)
         except Exception:  # noqa: BLE001
             pass
     media = Path(settings.intro_media_path)
     text = intro(settings)
-    kb = intro_kb(payments_on=settings.payments_enabled, price=price)
+    kb = intro_kb(payments_on=pay_on, price=price)
     menu = _menu(settings, uid)
     if media.exists() and media.stat().st_size > 0:
         try:
@@ -281,15 +344,28 @@ async def ux_support(event: Message | CallbackQuery, state: FSMContext, settings
 
 
 @router.message(F.text.in_({"⚙️ Settings", "⚙️ Sozlamalar"}))
-async def ux_settings(message: Message, state: FSMContext, settings: Settings) -> None:
+async def ux_settings(message: Message, state: FSMContext, settings: Settings, billing: BillingService) -> None:
     u = message.from_user
     await safe_delete_message(message)
     lang = u.language_code if u else "uz"
+    pay_on = await _pay_on(billing)
+    price, _ = await billing.get_price(u.id) if u else (settings.effective_price, [])
+    days = await billing.sub_days()
+    text = settings_text(settings, lang or "uz")
+    # override static payments line with runtime values
+    text = (
+        f"⚙️ <b>Sozlamalar</b>\n"
+        f"━━━━━━━━━━━━━━━━\n\n"
+        f"Til: <b>{lang or 'uz'}</b>\n"
+        f"To‘lov: <b>{'⭐ Stars (yoqilgan)' if pay_on else '🧪 Test (o‘chiq)'}</b>\n"
+        f"Tarif: <b>{price}★</b> / {days} kun\n"
+        f"Support: {settings.support_url}"
+    )
     await show(
         message.bot,
         message.chat.id,
         state,
-        settings_text(settings, lang or "uz"),
+        text,
         _menu(settings, u.id if u else None),
     )
 
@@ -332,21 +408,31 @@ async def ux_subscription(
         return
 
     await billing.ensure_user(u.id, u.username, u.full_name)
+    pay_on = await _pay_on(billing)
     panel = await billing.get_panel(u.id)
     sub = panel.get("subscription")
-
     price, tags = await billing.get_price(u.id)
 
-    if data == "ux:pay" or (data == "ux:renew" and settings.payments_enabled):
-        if settings.payments_enabled:
-            payload, amount = await billing.create_invoice_payload(u.id, purpose="renewal")
-            await billing.send_stars_invoice(msg.bot, msg.chat.id, payload, amount=amount)
-            await msg.answer(payment_sent(settings).replace(str(settings.subscription_price_stars), str(amount), 1))
+    if data in {"ux:pay", "ux:renew"}:
+        if not pay_on:
+            await msg.answer("🧪 Test rejim: to‘lov o‘chiq.\n✨ Bot ochish orqali davom eting.")
             return
-        await msg.answer("🧪 Test rejim: to‘lov o‘chiq.\n✨ Bot ochish orqali davom eting.")
+        purpose = "renewal" if (sub and sub.status in {"active", "grace", "expired"}) else "new_subscription"
+        activated = await _checkout(
+            msg.bot, msg.chat.id, state, billing, settings, u.id, purpose=purpose
+        )
+        if activated:
+            panel2 = await billing.get_panel(u.id)
+            dep = panel2.get("deployment")
+            if dep and dep.status == "suspended":
+                try:
+                    await deploy.start(dep.id)
+                    await msg.answer("🟢 Suspend bot qayta ishga tushdi.")
+                except Exception:  # noqa: BLE001
+                    logger.exception("reactivate failed")
         return
 
-    if not sub:
+    if not sub or sub.status in {"expired", "cancelled"}:
         text = pricing_pitch(settings, final_price=price, tags=tags)
     else:
         days_left = panel.get("days_left")
@@ -360,19 +446,23 @@ async def ux_subscription(
         )
         if tags:
             text += "\n\n" + " · ".join(tags)
+        credit = panel.get("credit") or 0
+        if credit:
+            text += f"\n🎁 Bonus balans: <b>{credit}★</b>"
     await show(
         msg.bot,
         msg.chat.id,
         state,
         text,
-        sub_kb(payments_on=settings.payments_enabled, price=price),
+        sub_kb(payments_on=pay_on, price=price),
     )
 
 
 @router.pre_checkout_query()
-async def pre_checkout(q: PreCheckoutQuery, settings: Settings) -> None:
-    if not settings.payments_enabled:
-        await q.answer(ok=False, error_message="Payments are disabled in test mode.")
+async def pre_checkout(q: PreCheckoutQuery, billing: BillingService) -> None:
+    ok, err = await billing.validate_checkout(q.invoice_payload, q.total_amount)
+    if not ok:
+        await q.answer(ok=False, error_message=(err or "To‘lov rad etildi")[:200])
         return
     await q.answer(ok=True)
 
@@ -385,7 +475,7 @@ async def on_paid(
     settings: Settings,
     deploy: DeploymentEngine,
 ) -> None:
-    if not settings.payments_enabled:
+    if not await _pay_on(billing):
         return
     p = message.successful_payment
     if not p or p.currency != "XTR":
@@ -395,19 +485,32 @@ async def on_paid(
             p.invoice_payload, p.telegram_payment_charge_id, p.provider_payment_charge_id
         )
         sub = res["subscription"]
-        # restore suspended bot
-        if message.from_user:
-            panel = await billing.get_panel(message.from_user.id)
-            dep = panel.get("deployment")
-            if dep and dep.status == "suspended":
-                try:
-                    await deploy.start(dep.id)
-                except Exception:  # noqa: BLE001
-                    logger.exception("reactivate failed")
-        await state.set_state(DeployStates.waiting_token)
-        await state.update_data(subscription_id=sub.id if sub else None, deploying=False)
-        await message.answer(payment_ok())
-        await message.answer(ask_token())
+        purpose = res.get("purpose") or "new_subscription"
+        panel = await billing.get_panel(message.from_user.id) if message.from_user else {}
+        dep = panel.get("deployment")
+
+        # restore suspended bot after renewal
+        if dep and dep.status == "suspended":
+            try:
+                await deploy.start(dep.id)
+            except Exception:  # noqa: BLE001
+                logger.exception("reactivate failed")
+
+        need_token = not bool(dep) or dep.status == "deleted"
+        # renewals with existing bot: no token ask
+        if purpose in {"renewal", "reactivate"} and dep and dep.status != "deleted":
+            need_token = False
+
+        await message.answer(
+            payment_ok(need_token=need_token),
+            reply_markup=_menu(settings, message.from_user.id if message.from_user else None),
+        )
+        if need_token:
+            await state.set_state(DeployStates.waiting_token)
+            await state.update_data(subscription_id=sub.id if sub else None, deploying=False)
+            await message.answer(ask_token())
+        else:
+            await state.clear()
     except Exception as e:  # noqa: BLE001
         logger.exception("payment activate")
         await message.answer(friendly_error(e), reply_markup=after_error_kb())
@@ -417,20 +520,26 @@ async def on_paid(
 
 async def _begin_create(message: Message, state: FSMContext, billing: BillingService, settings: Settings, user) -> None:
     if user.id in _active or (await state.get_data()).get("deploying"):
-        await message.answer("A deployment is already in progress. Please wait.")
+        await message.answer("⏳ Deploy allaqachon ketmoqda. Biroz kuting…")
         return
     await billing.ensure_user(user.id, user.username, user.full_name)
+    pay_on = await _pay_on(billing)
+    panel = await billing.get_panel(user.id)
+    sub = panel.get("subscription")
 
-    if settings.payments_enabled:
-        panel = await billing.get_panel(user.id)
-        sub = panel.get("subscription")
-        if not sub or sub.status not in {"active", "grace"}:
-            payload, amount = await billing.create_invoice_payload(user.id)
-            await billing.send_stars_invoice(message.bot, message.chat.id, payload, amount=amount)
-            await message.answer(
-                payment_sent(settings).replace(str(settings.subscription_price_stars), str(amount), 1)
+    if pay_on:
+        if not billing.has_active_sub(sub):
+            purpose = "renewal" if (sub and sub.status in {"expired", "grace"}) else "new_subscription"
+            activated = await _checkout(
+                message.bot, message.chat.id, state, billing, settings, user.id, purpose=purpose
             )
-            return
+            if not activated:
+                return
+            # free credit path may have activated — re-read panel
+            panel = await billing.get_panel(user.id)
+            sub = panel.get("subscription")
+            if not billing.has_active_sub(sub):
+                return
     else:
         res = await billing.grant_test_subscription(user.id)
         sub = res["subscription"]
@@ -486,14 +595,16 @@ async def on_token(
         db_user = await billing.ensure_user(u.id, u.username, u.full_name)
         panel = await billing.get_panel(u.id)
         sub = panel.get("subscription")
-    if not sub or sub.status not in {"active", "grace"}:
-        if not settings.payments_enabled:
+    pay_on = await _pay_on(billing)
+    if not billing.has_active_sub(sub):
+        if not pay_on:
             res = await billing.grant_test_subscription(u.id)
             sub, db_user = res["subscription"], res["user"]
         else:
+            price, _ = await billing.get_price(u.id)
             await message.answer(
-                "💎 Avval obuna kerak.",
-                reply_markup=sub_kb(payments_on=True, price=settings.subscription_price_stars),
+                payment_need_sub(price),
+                reply_markup=sub_kb(payments_on=True, price=price),
             )
             await state.clear()
             return
@@ -640,13 +751,14 @@ async def ux_bots(
         return
     panel = await billing.get_panel(u.id)
     dep = panel.get("deployment")
+    pay_on = await _pay_on(billing)
     if not dep:
         await show(
             msg.bot,
             msg.chat.id,
             state,
             empty_bots(),
-            empty_bots_kb(payments_on=settings.payments_enabled),
+            empty_bots_kb(payments_on=pay_on),
         )
         return
     await _show_bot_card(msg, state, billing, deploy, settings, u.id, dep.id, engine=deploy)
@@ -667,12 +779,13 @@ async def _show_bot_card(
     if not dep or dep.id != dep_id:
         dep = await billing.get_deployment(dep_id)
     if not dep or dep.status == "deleted":
+        pay_on = await _pay_on(billing)
         await show(
             msg.bot,
             msg.chat.id,
             state,
             "🔍 Bu bot endi mavjud emas.\nYangi bot ochishingiz mumkin.",
-            empty_bots_kb(payments_on=settings.payments_enabled),
+            empty_bots_kb(payments_on=pay_on),
         )
         return
     eng = engine or deploy
@@ -753,11 +866,13 @@ async def bot_actions(
         return
 
     try:
+        pay_on = await _pay_on(billing)
+        price, _ = await billing.get_price(cb.from_user.id)
         if action == "start":
             if dep.status == "suspended":
                 await cb.message.answer(
-                    "🔴 Bot suspend.\nAvval obunani yangilang.",
-                    reply_markup=sub_kb(payments_on=settings.payments_enabled, price=settings.subscription_price_stars),
+                    "🔴 Bot suspend.\nAvval obunani yangilang ⭐",
+                    reply_markup=sub_kb(payments_on=pay_on, price=price),
                 )
                 return
             await deploy.start(dep_id)
@@ -766,6 +881,12 @@ async def bot_actions(
             await deploy.stop(dep_id)
             note = "Bot to‘xtatildi"
         elif action == "restart":
+            if dep.status == "suspended":
+                await cb.message.answer(
+                    "🔴 Suspend botni restart qilib bo‘lmaydi.\nAvval obunani yangilang ⭐",
+                    reply_markup=sub_kb(payments_on=pay_on, price=price),
+                )
+                return
             await deploy.restart(dep_id)
             note = "Bot qayta ishga tushdi"
         elif action == "backup":
@@ -780,7 +901,7 @@ async def bot_actions(
             await deploy.purge(dep_id)
             await cb.message.edit_text(
                 "🗑 <b>Bot o‘chirildi</b>\n\nBarcha ma’lumotlar butunlay olib tashlandi.",
-                reply_markup=empty_bots_kb(payments_on=settings.payments_enabled),
+                reply_markup=empty_bots_kb(payments_on=pay_on),
             )
             return
         else:

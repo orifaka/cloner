@@ -81,6 +81,7 @@ async def run_bot() -> None:
     from builder.store import Store
 
     store = Store(settings, sf)
+    await store.bootstrap()
     billing = BillingService(settings, sf, store=store)
     deploy = DeploymentEngine(settings, sf)
 
@@ -97,7 +98,17 @@ async def run_bot() -> None:
         ) from e
     if me.username:
         settings.builder_bot_username = me.username
-    logger.info("online @%s id=%s", me.username, me.id)
+    pay_on = await billing.payments_enabled()
+    price = await billing.base_price()
+    days = await billing.sub_days()
+    logger.info(
+        "online @%s id=%s | payments=%s price=%s★ period=%sd",
+        me.username,
+        me.id,
+        pay_on,
+        price,
+        days,
+    )
 
     dp = Dispatcher(storage=MemoryStorage())
     dp.errors.register(_on_error)
