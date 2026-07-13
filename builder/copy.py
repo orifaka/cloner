@@ -15,38 +15,61 @@ _HR = "──────────────"
 
 
 def intro(s: Settings) -> str:
-    p, d = s.subscription_price_stars, s.subscription_days
+    base, d = s.subscription_price_stars, s.subscription_days
+    price = s.effective_price
+    promo = ""
+    if s.promo_enabled and s.promo_discount_stars > 0:
+        promo = (
+            f"\n{s.promo_title}\n"
+            f"{s.promo_text}\n"
+            f"⭐ <s>{base}</s> → <b>{price} Stars</b>\n"
+            f"{_HR}\n"
+        )
+    price_line = (
+        f"⭐ <b>{price} Stars</b>  ·  {d} kun"
+        if price < base
+        else f"⭐ <b>{base} Stars</b>  ·  {d} kun to‘liq hosting"
+    )
+    per_day = max(1, price // max(1, d))
     return (
         f"🕹 <b>{s.brand_name}</b>\n"
         f"<i>Professional Mafia Bot Hosting</i>\n"
-        f"{_HR}\n\n"
-        "Guruhingiz uchun <b>to‘liq avtomatik Mafia bot</b> —\n"
-        "server, sozlash va texnik og‘irlik <b>bizda</b>.\n\n"
-        "Siz faqat token berasiz.\n"
-        "Biz 60 soniyada ishga tushiramiz.\n\n"
-        f"<b>Nega tanlashadi</b>\n"
+        f"{_HR}\n"
+        f"{promo}\n"
+        "Guruhingiz uchun <b>to‘liq avtomatik Mafia bot</b>.\n"
+        "Server, deploy, xavfsizlik — <b>hammasi bizda</b>.\n\n"
+        "Siz: token berasiz\n"
+        "Biz: 60 soniyada Online qilamiz\n\n"
+        f"<b>Nega sotib olishadi</b>\n"
         "✅ O‘z botingiz · o‘z auditoriyangiz\n"
-        "✅ 1-click deploy · start / stop / restart\n"
-        "✅ Token shifrlanadi · ma’lumot himoyalangan\n"
-        "✅ Backup · monitoring · 24/7 online\n"
+        "✅ 1-click deploy / start / stop\n"
+        "✅ Token shifrlanadi\n"
+        "✅ Backup · monitoring\n"
         "✅ Texnik bilim shart emas\n\n"
         f"<b>Tarif</b>\n"
-        f"⭐ <b>{p} Stars</b>  ·  {d} kun to‘liq hosting\n"
-        "Kuniga atigi ~10 Stars\n\n"
+        f"{price_line}\n"
+        f"Kuniga ~{per_day} Stars\n\n"
         f"<b>Xavfsizlik</b>\n"
-        "🔐 AES encryption · alohida izolyatsiya\n"
-        "👑 Siz — botning yagona egasi va admini\n\n"
+        "🔐 AES · izolyatsiya · faqat siz adminsiz\n\n"
         f"{_HR}\n"
-        "👇 <b>Hoziroq boshlang</b> — birinchi botingiz tayyor"
+        "👇 <b>Hozir boshlang</b> — joylar cheklangan emas, lekin chegirma vaqtincha"
     )
 
 
-def pricing_pitch(s: Settings) -> str:
-    p, d = s.subscription_price_stars, s.subscription_days
+def pricing_pitch(s: Settings, *, final_price: Optional[int] = None, tags: Optional[list[str]] = None) -> str:
+    base, d = s.subscription_price_stars, s.subscription_days
+    p = final_price if final_price is not None else s.effective_price
+    tag_line = ""
+    if tags:
+        tag_line = " · ".join(tags) + "\n\n"
+    price_block = (
+        f"⭐ <s>{base}</s> → <b>{p} Stars</b>\n" if p < base else f"⭐ <b>{p} Telegram Stars</b>\n"
+    )
     return (
         f"💎 <b>Premium Plan</b>\n"
         f"{_HR}\n\n"
-        f"⭐ <b>{p} Telegram Stars</b>\n"
+        f"{tag_line}"
+        f"{price_block}"
         f"📅 <b>{d} kun</b> to‘liq xizmat\n\n"
         "<b>Ichiga kiradi</b>\n"
         "• Mustaqil Mafia bot\n"
@@ -55,11 +78,24 @@ def pricing_pitch(s: Settings) -> str:
         "• Yangilanishlar & support\n\n"
         "<b>Kafolat</b>\n"
         "Muddat tugasa — avval suspend.\n"
-        "7 kun ichida to‘lov → hammasi tiklanadi.\n"
-        "Hech narsa yashirin emas.\n\n"
+        "7 kun ichida to‘lov → hammasi tiklanadi.\n\n"
         f"{_HR}\n"
-        "Eng arzon yo‘l — o‘zingiz server sotib olish emas,\n"
-        f"<b>{p} Stars</b> bilan tayyor yechim."
+        f"Tayyor yechim — atigi <b>{p} Stars</b>."
+    )
+
+
+def referral_card(stats: dict, s: Settings) -> str:
+    return (
+        f"🎁 <b>Do‘st taklif qil — bonus ol</b>\n"
+        f"{_HR}\n\n"
+        f"Sizning link:\n<code>{stats.get('link', '—')}</code>\n\n"
+        f"Kod: <code>{stats.get('code', '—')}</code>\n"
+        f"Takliflar: <b>{stats.get('invites', 0)}</b>\n"
+        f"Bonus balans: <b>{stats.get('credit', 0)} Stars</b>\n\n"
+        f"<b>Qanday ishlaydi</b>\n"
+        f"• Do‘stingiz link orqali kiradi → −{s.referral_invitee_discount} Stars\n"
+        f"• U to‘lov qilsa → sizga +{s.referral_reward_days} kun obuna\n\n"
+        f"Linkni guruhlarga ulashing 🚀"
     )
 
 
@@ -359,7 +395,8 @@ def payment_sent(s: Settings) -> str:
         f"⭐ <b>To‘lov oynasi yuborildi</b>\n\n"
         f"Summa: <b>{s.subscription_price_stars} Stars</b>\n"
         f"Muddat: <b>{s.subscription_days} kun</b>\n\n"
-        f"Telegram ichida to‘lovni tasdiqlang."
+        f"Telegram ichida to‘lovni tasdiqlang.\n"
+        f"Chegirma bo‘lsa — summa avtomatik kamaygan."
     )
 
 

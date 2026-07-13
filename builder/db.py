@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
 from builder.config import Settings, get_settings
+
+logger = logging.getLogger("builder.db")
 
 
 class Base(DeclarativeBase):
@@ -34,10 +38,29 @@ def get_session_factory(settings: Optional[Settings] = None) -> async_sessionmak
     return _factory
 
 
+async def _sqlite_add_column(conn, table: str, column: str, coltype: str) -> None:
+    try:
+        await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}"))
+        logger.info("migrated %s.%s", table, column)
+    except Exception:  # noqa: BLE001
+        pass  # already exists
+
+
+async def migrate_schema(settings: Optional[Settings] = None) -> None:
+    """Add new columns on existing SQLite DBs without wiping data."""
+    eng = get_engine(settings)
+    async with eng.begin() as conn:
+        await _sqlite_add_column(conn, "users", "referral_code", "VARCHAR(32)")
+        await _sqlite_add_column(conn, "users", "referred_by_id", "INTEGER")
+        await _sqlite_add_column(conn, "users", "credit_stars", "INTEGER DEFAULT 0")
+        await _sqlite_add_column(conn, "users", "referral_paid", "BOOLEAN DEFAULT 0")
+
+
 async def init_db(settings: Optional[Settings] = None) -> None:
     eng = get_engine(settings)
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await migrate_schema(settings)
 
 
 async def close_db() -> None:

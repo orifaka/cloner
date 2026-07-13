@@ -19,6 +19,13 @@ class User(Base):
     language: Mapped[str] = mapped_column(String(8), default="uz")
     role: Mapped[str] = mapped_column(String(32), default="user")
     is_blocked: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Growth
+    referral_code: Mapped[Optional[str]] = mapped_column(String(32), unique=True, nullable=True, index=True)
+    referred_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    credit_stars: Mapped[int] = mapped_column(Integer, default=0)  # discount balance
+    referral_paid: Mapped[bool] = mapped_column(Boolean, default=False)  # invitee already rewarded referrer
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     subscriptions: Mapped[list[Subscription]] = relationship(back_populates="user")

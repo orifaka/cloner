@@ -34,12 +34,16 @@ class BillingService:
         self.settings = settings
         self.sf = session_factory
 
+    def _ref_code(self, telegram_id: int) -> str:
+        return f"r{telegram_id}"
+
     async def ensure_user(
         self,
         telegram_id: int,
         username: Optional[str],
         full_name: str,
         language: str = "uz",
+        referral_code: Optional[str] = None,
     ) -> User:
         async with self.sf() as s:
             u = (await s.execute(select(User).where(User.telegram_id == telegram_id))).scalar_one_or_none()
@@ -48,20 +52,89 @@ class BillingService:
                 u.full_name = full_name or u.full_name
                 if telegram_id in self.settings.admin_telegram_ids:
                     u.role = "admin"
+                if not u.referral_code:
+                    u.referral_code = self._ref_code(telegram_id)
+                # attach referrer only once for brand-new empty field
+                if referral_code and not u.referred_by_id and self.settings.referral_enabled:
+                    await self._apply_referral(s, u, referral_code)
                 await s.commit()
                 await s.refresh(u)
                 return u
+
             u = User(
                 telegram_id=telegram_id,
                 username=username,
                 full_name=full_name,
                 language=language,
                 role="admin" if telegram_id in self.settings.admin_telegram_ids else "user",
+                referral_code=self._ref_code(telegram_id),
+                credit_stars=0,
+                referral_paid=False,
             )
             s.add(u)
+            await s.flush()
+            if referral_code and self.settings.referral_enabled:
+                await self._apply_referral(s, u, referral_code)
             await s.commit()
             await s.refresh(u)
             return u
+
+    async def _apply_referral(self, s: AsyncSession, user: User, code: str) -> None:
+        code = (code or "").strip()
+        if not code or not code.startswith("r"):
+            return
+        ref = (await s.execute(select(User).where(User.referral_code == code))).scalar_one_or_none()
+        if not ref or ref.id == user.id:
+            return
+        if user.referred_by_id:
+            return
+        user.referred_by_id = ref.id
+        # invitee discount credit
+        disc = max(0, int(self.settings.referral_invitee_discount))
+        user.credit_stars = int(user.credit_stars or 0) + disc
+        logger.info("referral applied user=%s by=%s credit=%s", user.telegram_id, ref.telegram_id, disc)
+
+    def price_for_user(self, user: Optional[User] = None) -> tuple[int, list[str]]:
+        """Return final stars price and human labels for discounts."""
+        base = self.settings.subscription_price_stars
+        price = base
+        tags: list[str] = []
+        if self.settings.promo_enabled and self.settings.promo_discount_stars > 0:
+            off = self.settings.promo_discount_stars
+            price = max(50, price - off)
+            tags.append(f"🔥 Promo −{off}")
+        credit = int(user.credit_stars or 0) if user else 0
+        if credit > 0:
+            applied = min(credit, max(0, price - 50))
+            if applied > 0:
+                price -= applied
+                tags.append(f"🎁 Bonus −{applied}")
+        return price, tags
+
+    async def get_price(self, telegram_id: int) -> tuple[int, list[str]]:
+        async with self.sf() as s:
+            u = (await s.execute(select(User).where(User.telegram_id == telegram_id))).scalar_one_or_none()
+            return self.price_for_user(u)
+
+    async def referral_stats(self, telegram_id: int) -> dict[str, Any]:
+        async with self.sf() as s:
+            u = (await s.execute(select(User).where(User.telegram_id == telegram_id))).scalar_one_or_none()
+            if not u:
+                return {"code": "", "invites": 0, "credit": 0, "link": ""}
+            if not u.referral_code:
+                u.referral_code = self._ref_code(telegram_id)
+                await s.commit()
+            invites = (
+                await s.execute(select(func.count()).select_from(User).where(User.referred_by_id == u.id))
+            ).scalar() or 0
+            bot = self.settings.builder_bot_username or "bot"
+            link = f"https://t.me/{bot}?start={u.referral_code}"
+            return {
+                "code": u.referral_code,
+                "invites": invites,
+                "credit": int(u.credit_stars or 0),
+                "link": link,
+            }
 
     async def get_panel(self, telegram_id: int) -> dict[str, Any]:
         async with self.sf() as s:
@@ -118,11 +191,13 @@ class BillingService:
             logger.info("test sub granted user=%s exp=%s", telegram_id, sub.expires_at)
             return {"user": u, "subscription": sub}
 
-    async def create_invoice_payload(self, telegram_id: int, purpose: str = "new_subscription") -> str:
+    async def create_invoice_payload(self, telegram_id: int, purpose: str = "new_subscription") -> tuple[str, int]:
+        """Returns (payload, amount_stars)."""
         async with self.sf() as s:
             u = (await s.execute(select(User).where(User.telegram_id == telegram_id))).scalar_one_or_none()
             if not u:
                 raise ValueError("User topilmadi")
+            amount, _tags = self.price_for_user(u)
             sub = (
                 await s.execute(
                     select(Subscription)
@@ -131,24 +206,25 @@ class BillingService:
                 )
             ).scalars().first()
             if not sub or sub.status in {"expired", "cancelled"}:
-                sub = Subscription(user_id=u.id, price_stars=self.settings.subscription_price_stars)
+                sub = Subscription(user_id=u.id, price_stars=amount)
                 s.add(sub)
                 await s.flush()
-            payload = f"sub:{sub.id}:u:{u.id}:p:{purpose}:{int(utcnow().timestamp())}"
+            payload = f"sub:{sub.id}:u:{u.id}:p:{purpose}:a:{amount}:{int(utcnow().timestamp())}"
             s.add(
                 Payment(
                     user_id=u.id,
                     subscription_id=sub.id,
-                    amount_stars=self.settings.subscription_price_stars,
+                    amount_stars=amount,
                     purpose=purpose,
                     payload=payload,
                     status="pending",
                 )
             )
             await s.commit()
-            return payload
+            return payload, amount
 
-    async def send_stars_invoice(self, bot: Bot, chat_id: int, payload: str) -> None:
+    async def send_stars_invoice(self, bot: Bot, chat_id: int, payload: str, amount: Optional[int] = None) -> None:
+        stars = amount or self.settings.effective_price
         await bot.send_invoice(
             chat_id=chat_id,
             title=f"{self.settings.brand_name} · Premium",
@@ -162,7 +238,7 @@ class BillingService:
             prices=[
                 LabeledPrice(
                     label=f"{self.settings.subscription_days} kun hosting",
-                    amount=self.settings.subscription_price_stars,
+                    amount=stars,
                 )
             ],
         )
@@ -198,9 +274,39 @@ class BillingService:
             sub.grace_until = sub.expires_at + timedelta(days=grace_days)
             sub.reminder_7d_sent = sub.reminder_3d_sent = sub.reminder_24h_sent = False
             sub.last_daily_reminder_at = None
+
+            # spend credit stars used on this payment
+            payer = await s.get(User, pay.user_id)
+            if payer and pay.amount_stars < self.settings.subscription_price_stars:
+                used = self.settings.subscription_price_stars - pay.amount_stars
+                # approximate: clear applied credit
+                if self.settings.promo_enabled:
+                    used = max(0, used - self.settings.promo_discount_stars)
+                if used > 0 and (payer.credit_stars or 0) > 0:
+                    payer.credit_stars = max(0, int(payer.credit_stars) - used)
+
+            # reward referrer once
+            if payer and not payer.referral_paid and payer.referred_by_id:
+                ref = await s.get(User, payer.referred_by_id)
+                if ref:
+                    ref_sub = (
+                        await s.execute(
+                            select(Subscription)
+                            .where(Subscription.user_id == ref.id, Subscription.status.in_(["active", "grace"]))
+                            .order_by(Subscription.id.desc())
+                        )
+                    ).scalars().first()
+                    bonus = int(self.settings.referral_reward_days)
+                    if ref_sub and ref_sub.expires_at:
+                        base = as_utc(ref_sub.expires_at) or utcnow()
+                        ref_sub.expires_at = base + timedelta(days=bonus)
+                        ref_sub.status = "active"
+                    payer.referral_paid = True
+                    logger.info("referral reward +%sdays to user_id=%s", bonus, ref.id)
+
             await s.commit()
             await s.refresh(sub)
-            return {"payment": pay, "subscription": sub, "already": False}
+            return {"payment": pay, "subscription": sub, "already": False, "payer_id": pay.user_id}
 
     async def admin_overview(self) -> dict[str, Any]:
         async with self.sf() as s:

@@ -34,6 +34,23 @@ class Settings(BaseSettings):
     grace_period_hours: int = Field(default=168, alias="GRACE_PERIOD_HOURS")  # legacy alias (7d)
     payments_enabled: bool = Field(default=False, alias="PAYMENTS_ENABLED")
 
+    # Limited-time offer banner
+    promo_enabled: bool = Field(default=True, alias="PROMO_ENABLED")
+    promo_title: str = Field(default="🔥 LIMITED OFFER", alias="PROMO_TITLE")
+    promo_text: str = Field(
+        default="Bugun ochsangiz — maxsus chegirma!",
+        alias="PROMO_TEXT",
+    )
+    promo_discount_stars: int = Field(default=50, alias="PROMO_DISCOUNT_STARS")  # 300→250
+
+    # Referral program
+    referral_enabled: bool = Field(default=True, alias="REFERRAL_ENABLED")
+    referral_invitee_discount: int = Field(default=50, alias="REFERRAL_INVITEE_DISCOUNT")  # new user pays less
+    referral_reward_days: int = Field(default=7, alias="REFERRAL_REWARD_DAYS")  # referrer bonus days
+
+    # Optional intro media (gif/mp4) — if file exists, sent on /start
+    intro_media_path: str = Field(default=str(ROOT_DIR / "media" / "intro.mp4"), alias="INTRO_MEDIA_PATH")
+
     template_path: str = Field(default=str(ROOT_DIR / "template" / "mafia-bot"), alias="TEMPLATE_PATH")
     deployments_root: str = Field(default=str(ROOT_DIR / "data" / "deployments"), alias="DEPLOYMENTS_ROOT")
     backups_root: str = Field(default=str(ROOT_DIR / "data" / "backups"), alias="BACKUPS_ROOT")
@@ -43,6 +60,14 @@ class Settings(BaseSettings):
     brand_name: str = Field(default="True Mafia Builder", alias="BRAND_NAME")
     default_language: str = Field(default="uz", alias="DEFAULT_LANGUAGE")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+    @property
+    def effective_price(self) -> int:
+        """Base price after global promo (before personal credits)."""
+        price = self.subscription_price_stars
+        if self.promo_enabled and self.promo_discount_stars > 0:
+            price = max(50, price - self.promo_discount_stars)
+        return price
 
     @field_validator("aes_secret_key")
     @classmethod

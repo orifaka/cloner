@@ -7,8 +7,8 @@ def main_menu(*, is_admin: bool = False) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="✨ Bot ochish")],
         [KeyboardButton(text="🤖 Botlarim"), KeyboardButton(text="💎 Obuna")],
-        [KeyboardButton(text="📊 Kabinet"), KeyboardButton(text="⚙️ Sozlamalar")],
-        [KeyboardButton(text="❓ Yordam")],
+        [KeyboardButton(text="🎁 Referal"), KeyboardButton(text="📊 Kabinet")],
+        [KeyboardButton(text="⚙️ Sozlamalar"), KeyboardButton(text="❓ Yordam")],
     ]
     if is_admin:
         rows.append([KeyboardButton(text="🛠 Admin")])
@@ -20,11 +20,11 @@ def main_menu(*, is_admin: bool = False) -> ReplyKeyboardMarkup:
     )
 
 
-def intro_kb(*, payments_on: bool) -> InlineKeyboardMarkup:
+def intro_kb(*, payments_on: bool, price: int = 300) -> InlineKeyboardMarkup:
     """Primary conversion keyboard on home screen."""
     if payments_on:
         primary = InlineKeyboardButton(
-            text="⭐ 300 Stars · Bot ochish",
+            text=f"⭐ {price} Stars · Hozir ochish",
             callback_data="ux:create",
         )
     else:
@@ -36,10 +36,13 @@ def intro_kb(*, payments_on: bool) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [primary],
             [
-                InlineKeyboardButton(text="💎 Tariflar", callback_data="ux:sub"),
-                InlineKeyboardButton(text="❓ Qanday?", callback_data="ux:support"),
+                InlineKeyboardButton(text="💎 Tarif", callback_data="ux:sub"),
+                InlineKeyboardButton(text="🎁 Referal", callback_data="ux:ref"),
             ],
-            [InlineKeyboardButton(text="🤖 Botlarim", callback_data="ux:bots")],
+            [
+                InlineKeyboardButton(text="❓ Qanday?", callback_data="ux:support"),
+                InlineKeyboardButton(text="🤖 Botlarim", callback_data="ux:bots"),
+            ],
         ]
     )
 
@@ -109,13 +112,26 @@ def sub_kb(*, payments_on: bool, price: int = 300) -> InlineKeyboardMarkup:
         rows = [
             [InlineKeyboardButton(text=f"⭐ To‘lash · {price} Stars", callback_data="ux:pay")],
             [InlineKeyboardButton(text="✨ Bot ochish", callback_data="ux:create")],
+            [InlineKeyboardButton(text="🎁 Referal bonus", callback_data="ux:ref")],
         ]
     else:
         rows = [
             [InlineKeyboardButton(text="🚀 Test rejimda davom etish", callback_data="ux:create")],
+            [InlineKeyboardButton(text="🎁 Referal", callback_data="ux:ref")],
         ]
     rows.append([InlineKeyboardButton(text="🏠 Menyuga", callback_data="ux:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def referral_kb(link: str) -> InlineKeyboardMarkup:
+    share = f"https://t.me/share/url?url={link}&text=Mafia%20bot%20hosting%20—%20chegirma%20bilan!"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Do‘stlarga ulashish", url=share)],
+            [InlineKeyboardButton(text="✨ Bot ochish", callback_data="ux:create")],
+            [InlineKeyboardButton(text="🏠 Menyuga", callback_data="ux:home")],
+        ]
+    )
 
 
 def after_error_kb() -> InlineKeyboardMarkup:

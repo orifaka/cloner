@@ -6,10 +6,12 @@ import re
 from datetime import datetime, timezone
 
 from aiogram import Bot, F, Router
-from aiogram.filters import Command, CommandStart, StateFilter
+from pathlib import Path
+
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message, PreCheckoutQuery
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message, PreCheckoutQuery
 
 from builder.admin import router as admin_router
 from builder.billing import BillingService, as_utc
@@ -29,6 +31,7 @@ from builder.copy import (
     payment_ok,
     payment_sent,
     pricing_pitch,
+    referral_card,
     settings_text,
     subscription_card,
 )
@@ -42,6 +45,7 @@ from builder.keyboards import (
     empty_bots_kb,
     intro_kb,
     main_menu,
+    referral_kb,
     sub_kb,
     support_kb,
 )
@@ -75,23 +79,75 @@ def _exp_str(sub) -> str | None:
 
 # ── Home ───────────────────────────────────────────────
 
+async def _send_intro(bot, chat_id: int, state: FSMContext, settings: Settings, uid: int) -> None:
+    price, _ = (settings.effective_price, [])
+    # try optional media
+    media = Path(settings.intro_media_path)
+    text = intro(settings)
+    kb = intro_kb(payments_on=settings.payments_enabled, price=price)
+    menu = _menu(settings, uid)
+    if media.exists() and media.stat().st_size > 0:
+        try:
+            await present(bot, chat_id, state, "‎", reply_menu=menu, inline=None, wipe=True)
+            if media.suffix.lower() in {".gif", ".mp4", ".webm"}:
+                await bot.send_animation(
+                    chat_id,
+                    FSInputFile(str(media)),
+                    caption=text,
+                    reply_markup=kb,
+                )
+            else:
+                await bot.send_photo(
+                    chat_id,
+                    FSInputFile(str(media)),
+                    caption=text,
+                    reply_markup=kb,
+                )
+            return
+        except Exception:  # noqa: BLE001
+            logger.warning("intro media failed, fallback text")
+    await present(
+        bot,
+        chat_id,
+        state,
+        text,
+        reply_menu=menu,
+        inline=kb,
+        wipe=True,
+    )
+
+
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext, billing: BillingService, settings: Settings) -> None:
+async def cmd_start(
+    message: Message,
+    state: FSMContext,
+    billing: BillingService,
+    settings: Settings,
+    command: CommandObject,
+) -> None:
     await state.clear()
     u = message.from_user
     if not u:
         return
-    await billing.ensure_user(u.id, u.username, u.full_name, u.language_code or settings.default_language)
-    await safe_delete_message(message)
-    await present(
-        message.bot,
-        message.chat.id,
-        state,
-        intro(settings),
-        reply_menu=_menu(settings, u.id),
-        inline=intro_kb(payments_on=settings.payments_enabled),
-        wipe=False,
+    ref = None
+    if command.args:
+        arg = command.args.strip()
+        if arg.startswith("r"):
+            ref = arg
+    await billing.ensure_user(
+        u.id,
+        u.username,
+        u.full_name,
+        u.language_code or settings.default_language,
+        referral_code=ref,
     )
+    await safe_delete_message(message)
+    if ref:
+        await message.bot.send_message(
+            message.chat.id,
+            "🎁 <b>Referal chegirma faollashtirildi!</b>\nTo‘lovda avtomatik hisoblanadi.",
+        )
+    await _send_intro(message.bot, message.chat.id, state, settings, u.id)
 
 
 @router.callback_query(F.data == "ux:home")
@@ -100,21 +156,34 @@ async def ux_home(cb: CallbackQuery, state: FSMContext, settings: Settings) -> N
     if not cb.message or not cb.from_user:
         return
     await state.clear()
-    try:
-        await cb.message.edit_text(
-            intro(settings),
-            reply_markup=intro_kb(payments_on=settings.payments_enabled),
-            disable_web_page_preview=True,
-        )
-    except Exception:  # noqa: BLE001
-        await present(
-            cb.bot,
-            cb.message.chat.id,
-            state,
-            intro(settings),
-            reply_menu=_menu(settings, cb.from_user.id),
-            inline=intro_kb(payments_on=settings.payments_enabled),
-        )
+    await _send_intro(cb.bot, cb.message.chat.id, state, settings, cb.from_user.id)
+
+
+@router.message(F.text == "🎁 Referal")
+@router.callback_query(F.data == "ux:ref")
+async def ux_referral(
+    event: Message | CallbackQuery,
+    state: FSMContext,
+    billing: BillingService,
+    settings: Settings,
+) -> None:
+    if isinstance(event, CallbackQuery):
+        await safe_cb(event)
+        msg, u = event.message, event.from_user
+    else:
+        await safe_delete_message(event)
+        msg, u = event, event.from_user
+    if not msg or not u:
+        return
+    await billing.ensure_user(u.id, u.username, u.full_name)
+    stats = await billing.referral_stats(u.id)
+    await show(
+        msg.bot,
+        msg.chat.id,
+        state,
+        referral_card(stats, settings),
+        referral_kb(stats["link"]),
+    )
 
 
 @router.message(Command("help", "support"))
@@ -193,18 +262,19 @@ async def ux_subscription(
     panel = await billing.get_panel(u.id)
     sub = panel.get("subscription")
 
+    price, tags = await billing.get_price(u.id)
+
     if data == "ux:pay" or (data == "ux:renew" and settings.payments_enabled):
         if settings.payments_enabled:
-            payload = await billing.create_invoice_payload(u.id, purpose="renewal")
-            await billing.send_stars_invoice(msg.bot, msg.chat.id, payload)
-            await msg.answer(payment_sent(settings))
+            payload, amount = await billing.create_invoice_payload(u.id, purpose="renewal")
+            await billing.send_stars_invoice(msg.bot, msg.chat.id, payload, amount=amount)
+            await msg.answer(payment_sent(settings).replace(str(settings.subscription_price_stars), str(amount), 1))
             return
         await msg.answer("🧪 Test rejim: to‘lov o‘chiq.\n✨ Bot ochish orqali davom eting.")
         return
 
-    # Pricing pitch if no sub, card if has sub
     if not sub:
-        text = pricing_pitch(settings)
+        text = pricing_pitch(settings, final_price=price, tags=tags)
     else:
         text = subscription_card(
             settings,
@@ -212,12 +282,14 @@ async def ux_subscription(
             days_left=panel.get("days_left"),
             expires=_exp_str(sub),
         )
+        if tags:
+            text += "\n\n" + " · ".join(tags)
     await show(
         msg.bot,
         msg.chat.id,
         state,
         text,
-        sub_kb(payments_on=settings.payments_enabled, price=settings.subscription_price_stars),
+        sub_kb(payments_on=settings.payments_enabled, price=price),
     )
 
 
@@ -277,9 +349,11 @@ async def _begin_create(message: Message, state: FSMContext, billing: BillingSer
         panel = await billing.get_panel(user.id)
         sub = panel.get("subscription")
         if not sub or sub.status not in {"active", "grace"}:
-            payload = await billing.create_invoice_payload(user.id)
-            await billing.send_stars_invoice(message.bot, message.chat.id, payload)
-            await message.answer(payment_sent(settings))
+            payload, amount = await billing.create_invoice_payload(user.id)
+            await billing.send_stars_invoice(message.bot, message.chat.id, payload, amount=amount)
+            await message.answer(
+                payment_sent(settings).replace(str(settings.subscription_price_stars), str(amount), 1)
+            )
             return
     else:
         res = await billing.grant_test_subscription(user.id)
