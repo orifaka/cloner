@@ -94,7 +94,12 @@ class BillingService:
         user.credit_stars = int(user.credit_stars or 0) + disc
         logger.info("referral applied user=%s by=%s credit=%s", user.telegram_id, ref.telegram_id, disc)
 
-    def price_for_user(self, user: Optional[User] = None) -> tuple[int, list[str]]:
+    def price_for_user(
+        self,
+        user: Optional[User] = None,
+        *,
+        days_left: Optional[int] = None,
+    ) -> tuple[int, list[str]]:
         """Return final stars price and human labels for discounts."""
         base = self.settings.subscription_price_stars
         price = base
@@ -103,6 +108,20 @@ class BillingService:
             off = self.settings.promo_discount_stars
             price = max(50, price - off)
             tags.append(f"🔥 Promo −{off}")
+        # New user 24h flash
+        if user and user.created_at:
+            created = as_utc(user.created_at) or user.created_at
+            age_h = (utcnow() - created).total_seconds() / 3600 if created.tzinfo else 999
+            if age_h <= float(self.settings.new_user_hours) and self.settings.new_user_discount > 0:
+                off = self.settings.new_user_discount
+                price = max(50, price - off)
+                tags.append(f"⚡ 24s offer −{off}")
+        # Keep offer near expiry
+        if days_left is not None and days_left <= self.settings.keep_offer_days and days_left >= 0:
+            if self.settings.keep_offer_discount > 0:
+                off = self.settings.keep_offer_discount
+                price = max(50, price - off)
+                tags.append(f"🧡 Keep −{off}")
         credit = int(user.credit_stars or 0) if user else 0
         if credit > 0:
             applied = min(credit, max(0, price - 50))
@@ -112,9 +131,55 @@ class BillingService:
         return price, tags
 
     async def get_price(self, telegram_id: int) -> tuple[int, list[str]]:
+        panel = await self.get_panel(telegram_id)
         async with self.sf() as s:
             u = (await s.execute(select(User).where(User.telegram_id == telegram_id))).scalar_one_or_none()
-            return self.price_for_user(u)
+            return self.price_for_user(u, days_left=panel.get("days_left"))
+
+    async def payment_history(self, telegram_id: int, limit: int = 15) -> list[dict[str, Any]]:
+        async with self.sf() as s:
+            u = (await s.execute(select(User).where(User.telegram_id == telegram_id))).scalar_one_or_none()
+            if not u:
+                return []
+            rows = (
+                await s.execute(
+                    select(Payment).where(Payment.user_id == u.id).order_by(Payment.id.desc()).limit(limit)
+                )
+            ).scalars().all()
+            out = []
+            for p in rows:
+                dt = as_utc(p.paid_at) or as_utc(p.created_at)
+                out.append(
+                    {
+                        "amount": p.amount_stars,
+                        "status": p.status,
+                        "purpose": p.purpose,
+                        "date": dt.strftime("%Y-%m-%d %H:%M") if dt else "—",
+                    }
+                )
+            return out
+
+    async def grant_bonus_days(self, telegram_id: int, days: int) -> None:
+        if days <= 0:
+            return
+        async with self.sf() as s:
+            u = (await s.execute(select(User).where(User.telegram_id == telegram_id))).scalar_one_or_none()
+            if not u:
+                return
+            sub = (
+                await s.execute(
+                    select(Subscription)
+                    .where(Subscription.user_id == u.id, Subscription.status.in_(["active", "grace"]))
+                    .order_by(Subscription.id.desc())
+                )
+            ).scalars().first()
+            if not sub:
+                return
+            base = as_utc(sub.expires_at) or utcnow()
+            sub.expires_at = base + timedelta(days=days)
+            sub.status = "active"
+            await s.commit()
+            logger.info("bonus +%sdays user=%s", days, telegram_id)
 
     async def referral_stats(self, telegram_id: int) -> dict[str, Any]:
         async with self.sf() as s:
@@ -197,7 +262,20 @@ class BillingService:
             u = (await s.execute(select(User).where(User.telegram_id == telegram_id))).scalar_one_or_none()
             if not u:
                 raise ValueError("User topilmadi")
-            amount, _tags = self.price_for_user(u)
+            # days_left for keep-offer
+            days_left = None
+            sub_tmp = (
+                await s.execute(
+                    select(Subscription)
+                    .where(Subscription.user_id == u.id)
+                    .order_by(Subscription.id.desc())
+                )
+            ).scalars().first()
+            if sub_tmp and sub_tmp.expires_at:
+                exp = as_utc(sub_tmp.expires_at)
+                if exp:
+                    days_left = max(0, int((exp - utcnow()).total_seconds() // 86400))
+            amount, _tags = self.price_for_user(u, days_left=days_left)
             sub = (
                 await s.execute(
                     select(Subscription)

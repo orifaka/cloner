@@ -91,7 +91,50 @@ async def run_bot() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("lifecycle")
 
+    async def daily_backups() -> None:
+        """Auto-backup all running tenant bots once a day."""
+        try:
+            from sqlalchemy import select
+            from builder.models import Deployment
+
+            sf2 = get_session_factory()
+            async with sf2() as s:
+                deps = (
+                    await s.execute(select(Deployment).where(Deployment.status == "running"))
+                ).scalars().all()
+            for d in deps:
+                try:
+                    await deploy.backup(d.id)
+                    logger.info("auto-backup dep=%s", d.id)
+                except Exception:  # noqa: BLE001
+                    logger.warning("backup fail dep=%s", d.id)
+        except Exception:  # noqa: BLE001
+            logger.exception("daily_backups")
+
+    async def health_watch() -> None:
+        """Restart dead running processes (watchdog)."""
+        try:
+            from sqlalchemy import select
+            from builder.models import Deployment
+
+            sf2 = get_session_factory()
+            async with sf2() as s:
+                deps = (
+                    await s.execute(select(Deployment).where(Deployment.status == "running"))
+                ).scalars().all()
+            for d in deps:
+                if d.process_pid and not deploy._pid_alive(d.process_pid):
+                    logger.warning("dead process dep=%s pid=%s — restart", d.id, d.process_pid)
+                    try:
+                        await deploy.start(d.id)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("watchdog restart fail dep=%s", d.id)
+        except Exception:  # noqa: BLE001
+            logger.exception("health_watch")
+
     scheduler.add_job(life, "interval", minutes=30, id="life", replace_existing=True)
+    scheduler.add_job(daily_backups, "cron", hour=3, minute=15, id="backups", replace_existing=True)
+    scheduler.add_job(health_watch, "interval", minutes=5, id="health", replace_existing=True)
     scheduler.start()
 
     try:

@@ -48,6 +48,17 @@ class Settings(BaseSettings):
     referral_invitee_discount: int = Field(default=50, alias="REFERRAL_INVITEE_DISCOUNT")  # new user pays less
     referral_reward_days: int = Field(default=7, alias="REFERRAL_REWARD_DAYS")  # referrer bonus days
 
+    # New user flash (first N hours after signup)
+    new_user_hours: int = Field(default=24, alias="NEW_USER_HOURS")
+    new_user_discount: int = Field(default=30, alias="NEW_USER_DISCOUNT")  # extra off
+
+    # Keep offer when subscription days left <= 3
+    keep_offer_days: int = Field(default=3, alias="KEEP_OFFER_DAYS")
+    keep_offer_discount: int = Field(default=30, alias="KEEP_OFFER_DISCOUNT")
+
+    # First deploy bonus days
+    first_deploy_bonus_days: int = Field(default=1, alias="FIRST_DEPLOY_BONUS_DAYS")
+
     # Optional intro media (gif/mp4) — if file exists, sent on /start
     intro_media_path: str = Field(default=str(ROOT_DIR / "media" / "intro.mp4"), alias="INTRO_MEDIA_PATH")
 

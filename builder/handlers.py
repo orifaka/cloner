@@ -24,12 +24,14 @@ from builder.copy import (
     deploy_done,
     deploy_progress,
     empty_bots,
+    faq_text,
     fmt_dt,
     friendly_error,
     help_text,
     intro,
     payment_ok,
     payment_sent,
+    payments_history,
     pricing_pitch,
     referral_card,
     settings_text,
@@ -79,9 +81,13 @@ def _exp_str(sub) -> str | None:
 
 # ── Home ───────────────────────────────────────────────
 
-async def _send_intro(bot, chat_id: int, state: FSMContext, settings: Settings, uid: int) -> None:
-    price, _ = (settings.effective_price, [])
-    # try optional media
+async def _send_intro(bot, chat_id: int, state: FSMContext, settings: Settings, uid: int, billing: BillingService | None = None) -> None:
+    price = settings.effective_price
+    if billing:
+        try:
+            price, _ = await billing.get_price(uid)
+        except Exception:  # noqa: BLE001
+            pass
     media = Path(settings.intro_media_path)
     text = intro(settings)
     kb = intro_kb(payments_on=settings.payments_enabled, price=price)
@@ -147,16 +153,42 @@ async def cmd_start(
             message.chat.id,
             "🎁 <b>Referal chegirma faollashtirildi!</b>\nTo‘lovda avtomatik hisoblanadi.",
         )
-    await _send_intro(message.bot, message.chat.id, state, settings, u.id)
+    await _send_intro(message.bot, message.chat.id, state, settings, u.id, billing)
 
 
 @router.callback_query(F.data == "ux:home")
-async def ux_home(cb: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+async def ux_home(cb: CallbackQuery, state: FSMContext, settings: Settings, billing: BillingService) -> None:
     await safe_cb(cb)
     if not cb.message or not cb.from_user:
         return
     await state.clear()
-    await _send_intro(cb.bot, cb.message.chat.id, state, settings, cb.from_user.id)
+    await _send_intro(cb.bot, cb.message.chat.id, state, settings, cb.from_user.id, billing)
+
+
+@router.message(Command("faq"))
+@router.message(F.text.in_({"❓ FAQ", "❓ Yordam"}))
+@router.callback_query(F.data == "ux:faq")
+async def ux_faq(event: Message | CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    if isinstance(event, CallbackQuery):
+        await safe_cb(event)
+        msg = event.message
+    else:
+        await safe_delete_message(event)
+        msg = event
+    if not msg:
+        return
+    await show(msg.bot, msg.chat.id, state, faq_text(settings), support_kb(settings.support_url))
+
+
+@router.message(Command("payments", "tolovlar"))
+@router.message(F.text == "📋 To‘lovlar")
+async def ux_payments(message: Message, state: FSMContext, billing: BillingService, settings: Settings) -> None:
+    u = message.from_user
+    if not u:
+        return
+    await safe_delete_message(message)
+    rows = await billing.payment_history(u.id)
+    await show(message.bot, message.chat.id, state, payments_history(rows), _menu(settings, u.id))
 
 
 @router.message(F.text == "🎁 Referal")
@@ -187,7 +219,7 @@ async def ux_referral(
 
 
 @router.message(Command("help", "support"))
-@router.message(F.text.in_({"❓ Yordam", "❓ Support"}))
+@router.message(F.text.in_({"💬 Support", "❓ Support"}))
 @router.callback_query(F.data == "ux:support")
 async def ux_support(event: Message | CallbackQuery, state: FSMContext, settings: Settings) -> None:
     if isinstance(event, CallbackQuery):
@@ -276,11 +308,14 @@ async def ux_subscription(
     if not sub:
         text = pricing_pitch(settings, final_price=price, tags=tags)
     else:
+        days_left = panel.get("days_left")
+        keep = days_left is not None and days_left <= settings.keep_offer_days
         text = subscription_card(
             settings,
             status=sub.status if sub else None,
-            days_left=panel.get("days_left"),
+            days_left=days_left,
             expires=_exp_str(sub),
+            keep_offer=bool(keep),
         )
         if tags:
             text += "\n\n" + " · ".join(tags)
@@ -513,9 +548,16 @@ async def _bg_deploy(
         )
         panel = await billing.get_panel(tg_id)
         sub = panel.get("subscription")
+        # first deploy bonus day
+        try:
+            await billing.grant_bonus_days(tg_id, settings.first_deploy_bonus_days)
+        except Exception:  # noqa: BLE001
+            pass
+        panel = await billing.get_panel(tg_id)
+        sub = panel.get("subscription")
         await edit(
             deploy_done(identity.username, settings.subscription_days, _exp_str(sub)),
-            after_success_kb(dep_id),
+            after_success_kb(dep_id, bot_username=identity.username),
         )
         logger.info("DEPLOY OK user=%s dep=%s", tg_id, dep_id)
     except Exception as e:  # noqa: BLE001
@@ -610,7 +652,7 @@ async def _show_bot_card(
         msg.chat.id,
         state,
         text,
-        bot_actions_kb(dep.id, status=dep.status),
+        bot_actions_kb(dep.id, status=dep.status, bot_username=dep.bot_username),
     )
 
 
