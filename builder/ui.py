@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Optional
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -46,7 +46,7 @@ async def show(
     data = await state.get_data()
     ids = list(data.get("ui_ids") or [])
     ids.append(msg.message_id)
-    await state.update_data(ui_ids=ids[-3:])
+    await state.update_data(ui_ids=ids[-4:])
     return msg
 
 
@@ -61,8 +61,8 @@ async def replace_message(message: Message, text: str, reply_markup=None) -> Mes
         return await message.bot.send_message(message.chat.id, text, reply_markup=reply_markup)
 
 
-async def safe_cb(callback, text: str | None = None) -> None:
+async def safe_cb(callback, text: str | None = None, show_alert: bool = False) -> None:
     try:
-        await callback.answer(text)
+        await callback.answer(text, show_alert=show_alert)
     except (TelegramBadRequest, TelegramForbiddenError):
         pass

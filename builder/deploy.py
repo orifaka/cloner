@@ -26,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from builder.config import ROOT_DIR, Settings
-from builder.models import Deployment
+from builder.models import Deployment, User
 from builder.security import TokenCipher, generate_slug
 
 logger = logging.getLogger("builder.deploy")
@@ -83,6 +83,7 @@ class DeploymentEngine:
         bot_token: str,
         bot_identity: BotIdentity,
         progress_callback=None,
+        owner_telegram_id: int | None = None,
     ) -> int:
         async def report(step: str) -> None:
             logger.info("deploy step user=%s | %s", user_id, step)
@@ -90,6 +91,9 @@ class DeploymentEngine:
                 await progress_callback(step)
 
         async with self.sf() as s:
+            db_user = await s.get(User, user_id)
+            owner_tg = owner_telegram_id or (db_user.telegram_id if db_user else None)
+
             existing = (
                 await s.execute(
                     select(Deployment)
@@ -99,7 +103,9 @@ class DeploymentEngine:
             ).scalars().first()
 
             if existing and existing.status == "running":
-                return await self._update_token(existing.id, bot_token, bot_identity)
+                return await self._update_token(
+                    existing.id, bot_token, bot_identity, owner_telegram_id=owner_tg
+                )
 
             if existing and existing.status in {"suspended", "stopped"}:
                 existing.bot_token_encrypted = self.cipher.encrypt(bot_token)
@@ -107,6 +113,20 @@ class DeploymentEngine:
                 existing.bot_username = bot_identity.username
                 existing.bot_first_name = bot_identity.first_name
                 await s.commit()
+                if existing.project_path and owner_tg:
+                    db_url = (
+                        self.cipher.decrypt(existing.database_url_encrypted)
+                        if existing.database_url_encrypted
+                        else self._sqlite_url(Path(existing.project_path))
+                    )
+                    await asyncio.to_thread(
+                        self._write_env,
+                        Path(existing.project_path) / ".env",
+                        bot_token,
+                        bot_identity.username or f"bot_{bot_identity.id}",
+                        db_url,
+                        owner_tg,
+                    )
                 await self.start(existing.id)
                 return existing.id
 
@@ -145,7 +165,7 @@ class DeploymentEngine:
             await report("📁 1/4 · fayllar")
             project = await asyncio.to_thread(self._copy_template, slug)
 
-            await report("🔐 2/4 · sozlamalar")
+            await report("🔐 2/4 · sozlamalar + ADMIN_IDS")
             db_url = self._sqlite_url(project)
             await asyncio.to_thread(
                 self._write_env,
@@ -153,6 +173,7 @@ class DeploymentEngine:
                 bot_token,
                 bot_identity.username or f"bot_{bot_identity.id}",
                 db_url,
+                owner_tg,
             )
 
             async with self.sf() as s:
@@ -204,7 +225,13 @@ class DeploymentEngine:
                     await s.commit()
             raise
 
-    async def _update_token(self, deployment_id: int, token: str, identity: BotIdentity) -> int:
+    async def _update_token(
+        self,
+        deployment_id: int,
+        token: str,
+        identity: BotIdentity,
+        owner_telegram_id: int | None = None,
+    ) -> int:
         async with self.sf() as s:
             dep = await s.get(Deployment, deployment_id)
             if not dep or not dep.project_path:
@@ -219,6 +246,10 @@ class DeploymentEngine:
                 if dep.database_url_encrypted
                 else self._sqlite_url(project)
             )
+            owner_tg = owner_telegram_id
+            if owner_tg is None:
+                u = await s.get(User, dep.user_id)
+                owner_tg = u.telegram_id if u else None
             await s.commit()
         await asyncio.to_thread(
             self._write_env,
@@ -226,6 +257,7 @@ class DeploymentEngine:
             token,
             identity.username or f"bot_{identity.id}",
             db_url,
+            owner_tg,
         )
         await self.restart(deployment_id)
         return deployment_id
@@ -264,9 +296,35 @@ class DeploymentEngine:
     def _sqlite_url(self, project: Path) -> str:
         return f"sqlite+aiosqlite:///{(project / 'storage' / 'mafia.db').resolve().as_posix()}"
 
-    def _write_env(self, path: Path, token: str, username: str, database_url: str) -> None:
+    def _admin_ids_value(self, owner_telegram_id: int | None) -> str:
+        """
+        Tenant mafia bot ADMIN_IDS:
+        - bot creator (owner) telegram id
+        - plus platform admins from .env (so host owner can also admin)
+        """
+        ids: list[str] = []
+        seen: set[int] = set()
+        if owner_telegram_id:
+            ids.append(str(int(owner_telegram_id)))
+            seen.add(int(owner_telegram_id))
+        for aid in self.settings.admin_telegram_ids:
+            if aid not in seen:
+                ids.append(str(aid))
+                seen.add(aid)
+        return ",".join(ids)
+
+    def _write_env(
+        self,
+        path: Path,
+        token: str,
+        username: str,
+        database_url: str,
+        owner_telegram_id: int | None = None,
+    ) -> None:
+        admin_ids = self._admin_ids_value(owner_telegram_id)
+        logger.info("writing .env ADMIN_IDS=%s for @%s", admin_ids, username)
         path.write_text(
-            f"""# Auto-generated — do not edit template source
+            f"""# Auto-generated by Mafia Builder — do not edit template source
 BOT_TOKEN={token}
 BOT_USERNAME={username}
 DATABASE_URL={database_url}
@@ -277,7 +335,7 @@ DEFAULT_LANGUAGE=uz
 NEWS_CHANNEL_URL=https://t.me/WorldMafiaNews
 NEWS_BONUS_CHANNEL=@WorldMafiaNews
 SUPPORT_URL={self.settings.support_url}
-ADMIN_IDS=
+ADMIN_IDS={admin_ids}
 MIN_PLAYERS=4
 REGISTRATION_TIMEOUT=90
 NIGHT_TIMEOUT=60

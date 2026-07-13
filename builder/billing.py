@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from aiogram import Bot
 from aiogram.types import LabeledPrice
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -189,6 +189,52 @@ class BillingService:
             await s.commit()
             await s.refresh(sub)
             return {"payment": pay, "subscription": sub, "already": False}
+
+    async def admin_overview(self) -> dict[str, Any]:
+        async with self.sf() as s:
+            users = (await s.execute(select(func.count()).select_from(User))).scalar() or 0
+            deps = (await s.execute(select(Deployment).where(Deployment.status != "deleted"))).scalars().all()
+            pays = (
+                await s.execute(select(Payment).where(Payment.status == "success"))
+            ).scalars().all()
+            stars = sum(p.amount_stars for p in pays)
+            by_status: dict[str, int] = {}
+            for d in deps:
+                by_status[d.status] = by_status.get(d.status, 0) + 1
+            active_subs = (
+                await s.execute(select(func.count()).select_from(Subscription).where(Subscription.status == "active"))
+            ).scalar() or 0
+            return {
+                "users": users,
+                "deployments": len(deps),
+                "running": by_status.get("running", 0),
+                "stopped": by_status.get("stopped", 0),
+                "suspended": by_status.get("suspended", 0),
+                "failed": by_status.get("failed", 0),
+                "provisioning": by_status.get("provisioning", 0),
+                "active_subs": active_subs,
+                "payments": len(pays),
+                "stars": stars,
+                "deps": deps,
+            }
+
+    async def list_users(self, limit: int = 30) -> list[User]:
+        async with self.sf() as s:
+            return list(
+                (
+                    await s.execute(select(User).order_by(User.id.desc()).limit(limit))
+                ).scalars().all()
+            )
+
+    async def get_deployment(self, dep_id: int) -> Optional[Deployment]:
+        async with self.sf() as s:
+            return (
+                await s.execute(
+                    select(Deployment)
+                    .options(selectinload(Deployment.user), selectinload(Deployment.subscription))
+                    .where(Deployment.id == dep_id)
+                )
+            ).scalar_one_or_none()
 
     async def process_lifecycle(self, bot: Bot, deploy_engine) -> None:
         async with self.sf() as s:

@@ -54,6 +54,18 @@ tail -f bot.log
 2. `🚀 Ochish` (test: `PAYMENTS_ENABLED=false`)
 3. BotFather token
 4. Deploy avtomatik → mijoz boti `data/deployments/<slug>/` da ishlaydi
+5. Yaratuvchi avtomatik `ADMIN_IDS` ga yoziladi (Mafia bot admin)
+
+## Admin panel (faqat siz)
+
+`.env` da:
+
+```env
+ADMIN_TELEGRAM_IDS=SIZNING_TELEGRAM_ID
+```
+
+- `/admin` yoki **🛠 Admin** tugmasi (faqat shu ID)
+- Dashboard, botlar, start/stop/restart, log, users, payments, broadcast
 
 ## To‘lov
 
