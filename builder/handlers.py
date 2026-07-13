@@ -548,9 +548,15 @@ async def _bg_deploy(
         )
         panel = await billing.get_panel(tg_id)
         sub = panel.get("subscription")
-        # first deploy bonus day
+        # +1 day bonus only once (first successful deploy for this user)
         try:
-            await billing.grant_bonus_days(tg_id, settings.first_deploy_bonus_days)
+            panel0 = await billing.get_panel(tg_id)
+            dep0 = panel0.get("deployment")
+            if dep0 and dep0.id == dep_id and settings.first_deploy_bonus_days > 0:
+                # crude: if no prior success payments / first bot
+                hist = await billing.payment_history(tg_id, limit=5)
+                if len(hist) <= 1:
+                    await billing.grant_bonus_days(tg_id, settings.first_deploy_bonus_days)
         except Exception:  # noqa: BLE001
             pass
         panel = await billing.get_panel(tg_id)
