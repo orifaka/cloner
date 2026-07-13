@@ -163,7 +163,8 @@ class DeploymentEngine:
                 dep.database_url_encrypted = self.cipher.encrypt(db_url)
                 await s.commit()
 
-            await report("📦 3/4 · python (host venv)")
+            # NO pip / NO new venv during deploy (shared hosting safe)
+            await report("📦 3/4 · python tanlash")
             await asyncio.to_thread(self._ensure_shared_runtime)
 
             await report("🚀 4/4 · start")
@@ -300,98 +301,97 @@ LOG_LEVEL=INFO
         p.mkdir(parents=True, exist_ok=True)
         return p
 
-    def _runtime_req(self) -> Path:
-        platform = ROOT_DIR / "infra" / "mafia-runtime-requirements.txt"
-        if platform.exists():
-            return platform
-        return self.settings.template_dir / "requirements.txt"
-
-    def _python_ok(self, py: str | Path) -> bool:
-        """True if this interpreter can import mafia core deps."""
+    def _python_has_core_deps(self, py: str | Path) -> bool:
+        """Soft check — never installs packages."""
         try:
             r = subprocess.run(
                 [
                     str(py),
                     "-c",
-                    "import aiogram, sqlalchemy, aiosqlite, dotenv, pydantic; print('ok')",
+                    "import aiogram, sqlalchemy, aiosqlite; print('ok')",
                 ],
                 capture_output=True,
                 text=True,
-                timeout=45,
+                timeout=30,
             )
             return r.returncode == 0 and "ok" in (r.stdout or "")
         except Exception as e:  # noqa: BLE001
-            logger.warning("python check failed %s: %s", py, e)
+            logger.warning("python check %s: %s", py, e)
             return False
 
     def _resolve_python(self) -> str:
         """
-        Shared hosting: DO NOT build a second venv (often fails / OOM / kill).
-        Prefer the same Python that runs main.py (already has packages).
+        NEVER run pip during deploy (shared host kills it / OOM / timeout).
+        Always reuse the Python that runs main.py.
         """
-        # 1) Explicit env
+        candidates: list[str] = []
+
         for key in ("MAFIA_PYTHON", "TENANT_PYTHON"):
             val = os.environ.get(key, "").strip()
-            if val and Path(val).exists() and self._python_ok(val):
-                logger.info("runtime python (env %s): %s", key, val)
-                return val
+            if val:
+                candidates.append(val)
 
-        # 2) Current process interpreter (best for shared host)
-        current = sys.executable
-        if current and self._python_ok(current):
-            logger.info("runtime python (host/sys): %s", current)
-            return current
+        if sys.executable:
+            candidates.append(sys.executable)
 
-        # 3) Settings python_executable
-        configured = self.settings.python_executable
-        if configured and self._python_ok(configured):
-            logger.info("runtime python (settings): %s", configured)
-            return configured
+        cfg = (self.settings.python_executable or "").strip()
+        if cfg:
+            candidates.append(cfg)
 
-        # 4) Try install missing deps into current interpreter (no new venv)
-        if current:
-            req = self._runtime_req()
-            if req.exists():
-                logger.info("host python missing deps — pip install into current env")
-                r = subprocess.run(
-                    [current, "-m", "pip", "install", "-r", str(req)],
-                    capture_output=True,
-                    text=True,
-                    timeout=600,
-                )
-                out = ((r.stderr or "") + "\n" + (r.stdout or "")).strip()
-                if r.returncode == 0 and self._python_ok(current):
-                    logger.info("host python deps ok after pip")
-                    return current
-                logger.error("pip into host failed:\n%s", out[:1500])
+        # Common shared-host venv next to project
+        for rel in (
+            ROOT_DIR / "venv" / "bin" / "python",
+            ROOT_DIR / "venv" / "bin" / "python3",
+            ROOT_DIR / ".venv" / "bin" / "python",
+            ROOT_DIR / ".venv" / "bin" / "python3",
+            ROOT_DIR.parent / "venv" / "bin" / "python",
+            ROOT_DIR.parent / "venv" / "bin" / "python3",
+        ):
+            candidates.append(str(rel))
+
+        seen: set[str] = set()
+        for py in candidates:
+            if not py or py in seen:
+                continue
+            seen.add(py)
+            if not Path(py).exists():
+                continue
+            if self._python_has_core_deps(py):
+                logger.info("runtime python: %s", py)
+                return py
+            logger.warning("python exists but missing deps: %s", py)
+
+        # Last resort: still use host interpreter (bot.err.log will show ImportError)
+        if sys.executable and Path(sys.executable).exists():
+            logger.warning(
+                "core deps missing on %s — starting anyway. "
+                "Run once: pip install -r requirements.txt",
+                sys.executable,
+            )
+            return sys.executable
 
         raise RuntimeError(
-            "Mafia bot uchun Python topilmadi.\n"
-            "Yechim (shared host):\n"
+            "Python topilmadi. Shared hostda bir marta:\n"
             "  source venv/bin/activate\n"
-            "  pip install -r infra/mafia-runtime-requirements.txt\n"
-            "  python main.py\n"
-            f"Hozirgi python: {current}"
+            "  pip install -r requirements.txt\n"
+            "  python main.py"
         )
 
     def _ensure_shared_runtime(self, force: bool = False) -> None:
-        """Resolve python only — no separate venv on shared hosting."""
+        """Only pick python path — NO pip, NO venv create."""
         py = self._resolve_python()
-        # cache path for start
         cache = self._runtime_dir() / "python.path"
         cache.write_text(py, encoding="utf-8")
-        logger.info("runtime ready: %s", py)
+        logger.info("runtime ready (no pip): %s", py)
 
     def _start_process(self, project: Path, slug: str) -> int:
-        self._ensure_shared_runtime()
+        # Resolve python WITHOUT any package installation
+        py = self._resolve_python()
         cache = self._runtime_dir() / "python.path"
-        if cache.exists():
-            py = cache.read_text(encoding="utf-8").strip()
-        else:
-            py = self._resolve_python()
-
-        if not py or not Path(py).exists():
-            raise RuntimeError(f"Runtime python yo'q: {py}")
+        try:
+            cache.write_text(py, encoding="utf-8")
+        except OSError:
+            pass
 
         pid_path = project / "bot.pid"
         if pid_path.exists():
@@ -406,6 +406,7 @@ LOG_LEVEL=INFO
         if sys.platform == "win32":
             flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
 
+        logger.info("starting tenant bot slug=%s with %s", slug, py)
         proc = subprocess.Popen(
             [py, "-m", "app.main"],
             cwd=str(project),
