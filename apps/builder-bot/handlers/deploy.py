@@ -142,19 +142,23 @@ async def on_token(
             return
 
     check_msg = await show(message.bot, message.chat.id, state, t_checking(), main_menu())
+    logger.info("TOKEN received user=%s — validating…", user.id)
 
     try:
         identity = await asyncio.wait_for(deploy.validate_token(raw), timeout=20.0)
+        logger.info("TOKEN ok user=%s bot=@%s id=%s", user.id, identity.username, identity.id)
     except TokenValidationError as exc:
+        logger.warning("TOKEN invalid user=%s err=%s", user.id, exc)
         await replace_message(check_msg, t_invalid(str(exc)))
         await state.set_state(DeployStates.waiting_token)
         return
     except asyncio.TimeoutError:
+        logger.warning("TOKEN timeout user=%s", user.id)
         await replace_message(check_msg, t_invalid("Telegram API timeout. Qayta yuboring."))
         await state.set_state(DeployStates.waiting_token)
         return
     except Exception as exc:  # noqa: BLE001
-        logger.exception("token validate failed")
+        logger.exception("token validate failed user=%s", user.id)
         await replace_message(check_msg, t_invalid(str(exc)[:200]))
         await state.set_state(DeployStates.waiting_token)
         return
@@ -169,6 +173,7 @@ async def on_token(
     await replace_message(check_msg, t_deploying(identity.username))
 
     _active_deploys.add(user.id)
+    logger.info("DEPLOY background start user=%s target=@%s", user.id, identity.username)
     asyncio.create_task(
         _run_deploy_job(
             bot=message.bot,
@@ -230,6 +235,7 @@ async def _run_deploy_job(
                 pass
 
     async def progress(step: str) -> None:
+        logger.info("DEPLOY progress user=%s @%s | %s", telegram_user_id, identity.username, step)
         await edit(t_progress(identity.username, step))
 
     try:
@@ -250,9 +256,9 @@ async def _run_deploy_job(
             )
         except Exception:  # noqa: BLE001
             pass
-        logger.info("deploy ok user=%s dep=%s bot=@%s", telegram_user_id, dep_id, identity.username)
+        logger.info("DEPLOY OK user=%s dep=%s bot=@%s", telegram_user_id, dep_id, identity.username)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("background deploy failed user=%s", telegram_user_id)
+        logger.exception("DEPLOY FAIL user=%s err=%s", telegram_user_id, exc)
         await edit(t_failed(str(exc)))
     finally:
         _active_deploys.discard(telegram_user_id)
@@ -260,3 +266,4 @@ async def _run_deploy_job(
             await state.update_data(deploying=False)
         except Exception:  # noqa: BLE001
             pass
+        logger.info("DEPLOY finished user=%s", telegram_user_id)

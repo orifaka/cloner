@@ -28,6 +28,10 @@ from platform_deploy.engine import DeploymentEngine
 from platform_monitoring.service import MonitoringService
 
 from handlers import deploy, payment, panel, start
+from logging_setup import setup_logging
+from middleware_log import OpsLogMiddleware
+
+logger = logging.getLogger("builder")
 
 
 async def global_error_handler(event: ErrorEvent) -> bool:
@@ -44,24 +48,24 @@ async def global_error_handler(event: ErrorEvent) -> bool:
                 "message to delete not found",
             )
         ):
-            logging.warning("Ignoring Telegram bad request: %s", exc)
+            logger.warning("Telegram soft: %s", exc)
             return True
     if isinstance(exc, (TelegramForbiddenError, TelegramRetryAfter)):
-        logging.warning("Telegram soft error: %s", exc)
+        logger.warning("Telegram soft: %s", exc)
         return True
-    logging.exception("Unhandled update error: %s", exc)
+    logger.exception("Unhandled update error: %s", exc)
     return True
 
 
 async def main() -> None:
     settings = get_settings()
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
-    logging.info("Starting Builder Bot (template will NOT be modified)")
+    log_path = setup_logging(ROOT, settings.log_level)
+    logger.info("=== Builder start === log_file=%s", log_path)
+    logger.info("payments_enabled=%s deploy_provider=%s", settings.payments_enabled, settings.deploy_provider)
+    logger.info("template=%s", settings.template_dir)
 
     await init_db(settings)
+    logger.info("DB ready: %s", settings.platform_database_url)
     session_factory = get_session_factory(settings)
 
     billing = BillingService(settings, session_factory)
@@ -75,7 +79,7 @@ async def main() -> None:
     me = await bot.get_me()
     if me.username:
         settings.builder_bot_username = me.username
-        logging.info("Builder bot: @%s", me.username)
+    logger.info("Bot online: @%s id=%s", me.username, me.id)
 
     dp = Dispatcher(storage=MemoryStorage())
     dp["settings"] = settings
@@ -83,7 +87,6 @@ async def main() -> None:
     dp["deploy"] = deploy_engine
     dp["monitor"] = monitor
 
-    # aiogram 3 dependency injection via workflow_data
     dp.workflow_data.update(
         settings=settings,
         billing=billing,
@@ -91,6 +94,7 @@ async def main() -> None:
         monitor=monitor,
     )
     dp.errors.register(global_error_handler)
+    dp.update.middleware(OpsLogMiddleware())
 
     dp.include_router(start.router)
     dp.include_router(payment.router)
@@ -101,15 +105,17 @@ async def main() -> None:
 
     async def lifecycle_job() -> None:
         try:
+            logger.info("lifecycle tick")
             await billing.process_lifecycle(bot, deploy_engine)
         except Exception:  # noqa: BLE001
-            logging.exception("lifecycle job failed")
+            logger.exception("lifecycle job failed")
 
     scheduler.add_job(lifecycle_job, "interval", minutes=30, id="subscription_lifecycle", replace_existing=True)
     scheduler.start()
+    logger.info("Scheduler started")
 
     try:
-        # drop_pending_updates: eski tugma/callbacklar botni chalkashtirmasin
+        logger.info("Polling start…")
         await dp.start_polling(
             bot,
             settings=settings,
@@ -120,9 +126,11 @@ async def main() -> None:
             drop_pending_updates=True,
         )
     finally:
+        logger.info("Shutting down…")
         scheduler.shutdown(wait=False)
         await close_db()
         await bot.session.close()
+        logger.info("=== Builder stopped ===")
 
 
 if __name__ == "__main__":
