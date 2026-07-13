@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mafia
+      POSTGRES_PASSWORD: mafia_secret
+      POSTGRES_DB: platform
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mafia -d platform"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  builder-bot:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.builder
+    env_file:
+      - ../.env
+    volumes:
+      - ../data:/app/data
+      - ../template:/app/template:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.builder
+    command: ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8080"]
+    working_dir: /app
+    env_file:
+      - ../.env
+    environment:
+      PYTHONPATH: /app/packages/core:/app/packages/billing:/app/packages/deploy:/app/packages/monitoring
+    volumes:
+      - ../data:/app/data
+      - ../template:/app/template:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:

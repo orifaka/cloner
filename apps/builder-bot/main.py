@@ -1,0 +1,136 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+from pathlib import Path
+
+# Make packages and this app importable when running: python apps/builder-bot/main.py
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "packages" / "core"))
+sys.path.insert(0, str(ROOT / "packages" / "billing"))
+sys.path.insert(0, str(ROOT / "packages" / "deploy"))
+sys.path.insert(0, str(ROOT / "packages" / "monitoring"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import ErrorEvent
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from platform_billing.service import BillingService
+from platform_core.config import get_settings
+from platform_core.database import close_db, get_session_factory, init_db
+from platform_deploy.engine import DeploymentEngine
+from platform_monitoring.service import MonitoringService
+
+from handlers import deploy, payment, panel, start
+
+
+async def global_error_handler(event: ErrorEvent) -> bool:
+    exc = event.exception
+    if isinstance(exc, TelegramBadRequest):
+        msg = str(exc).lower()
+        if any(
+            s in msg
+            for s in (
+                "query is too old",
+                "query id is invalid",
+                "message is not modified",
+                "message to edit not found",
+                "message to delete not found",
+            )
+        ):
+            logging.warning("Ignoring Telegram bad request: %s", exc)
+            return True
+    if isinstance(exc, (TelegramForbiddenError, TelegramRetryAfter)):
+        logging.warning("Telegram soft error: %s", exc)
+        return True
+    logging.exception("Unhandled update error: %s", exc)
+    return True
+
+
+async def main() -> None:
+    settings = get_settings()
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+    logging.info("Starting Builder Bot (template will NOT be modified)")
+
+    await init_db(settings)
+    session_factory = get_session_factory(settings)
+
+    billing = BillingService(settings, session_factory)
+    deploy_engine = DeploymentEngine(settings, session_factory)
+    monitor = MonitoringService()
+
+    bot = Bot(
+        settings.builder_bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    me = await bot.get_me()
+    if me.username:
+        settings.builder_bot_username = me.username
+        logging.info("Builder bot: @%s", me.username)
+
+    dp = Dispatcher(storage=MemoryStorage())
+    dp["settings"] = settings
+    dp["billing"] = billing
+    dp["deploy"] = deploy_engine
+    dp["monitor"] = monitor
+
+    # aiogram 3 dependency injection via workflow_data
+    dp.workflow_data.update(
+        settings=settings,
+        billing=billing,
+        deploy=deploy_engine,
+        monitor=monitor,
+    )
+    dp.errors.register(global_error_handler)
+
+    dp.include_router(start.router)
+    dp.include_router(payment.router)
+    dp.include_router(deploy.router)
+    dp.include_router(panel.router)
+
+    scheduler = AsyncIOScheduler()
+
+    async def lifecycle_job() -> None:
+        try:
+            await billing.process_lifecycle(bot, deploy_engine)
+        except Exception:  # noqa: BLE001
+            logging.exception("lifecycle job failed")
+
+    scheduler.add_job(lifecycle_job, "interval", minutes=30, id="subscription_lifecycle", replace_existing=True)
+    scheduler.start()
+
+    try:
+        # drop_pending_updates: eski tugma/callbacklar botni chalkashtirmasin
+        await dp.start_polling(
+            bot,
+            settings=settings,
+            billing=billing,
+            deploy=deploy_engine,
+            monitor=monitor,
+            allowed_updates=["message", "callback_query", "pre_checkout_query", "successful_payment"],
+            drop_pending_updates=True,
+        )
+    finally:
+        scheduler.shutdown(wait=False)
+        await close_db()
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    if sys.platform != "win32":
+        try:
+            import uvloop
+
+            uvloop.install()
+        except ImportError:
+            pass
+    asyncio.run(main())
