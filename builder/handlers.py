@@ -21,25 +21,31 @@ from builder.copy import (
     delete_warning,
     deploy_done,
     deploy_progress,
+    empty_bots,
     fmt_dt,
     friendly_error,
     help_text,
     intro,
+    payment_ok,
+    payment_sent,
+    pricing_pitch,
     settings_text,
     subscription_card,
 )
 from builder.deploy import DeploymentEngine, TokenError
 from builder.keyboards import (
     after_error_kb,
+    after_success_kb,
     bot_actions_kb,
     bots_list_kb,
     confirm_kb,
+    empty_bots_kb,
     intro_kb,
     main_menu,
     sub_kb,
     support_kb,
 )
-from builder.ui import replace_message, safe_cb, safe_delete_message, show
+from builder.ui import present, replace_message, safe_cb, safe_delete_message, show
 
 logger = logging.getLogger("builder.handlers")
 router = Router(name="builder")
@@ -77,18 +83,14 @@ async def cmd_start(message: Message, state: FSMContext, billing: BillingService
         return
     await billing.ensure_user(u.id, u.username, u.full_name, u.language_code or settings.default_language)
     await safe_delete_message(message)
-    await show(
+    await present(
         message.bot,
         message.chat.id,
         state,
         intro(settings),
-        _menu(settings, u.id),
+        reply_menu=_menu(settings, u.id),
+        inline=intro_kb(payments_on=settings.payments_enabled),
         wipe=False,
-    )
-    await message.bot.send_message(
-        message.chat.id,
-        "Choose an action:",
-        reply_markup=intro_kb(payments_on=settings.payments_enabled),
     )
 
 
@@ -99,13 +101,24 @@ async def ux_home(cb: CallbackQuery, state: FSMContext, settings: Settings) -> N
         return
     await state.clear()
     try:
-        await cb.message.edit_text(intro(settings), reply_markup=intro_kb(payments_on=settings.payments_enabled))
+        await cb.message.edit_text(
+            intro(settings),
+            reply_markup=intro_kb(payments_on=settings.payments_enabled),
+            disable_web_page_preview=True,
+        )
     except Exception:  # noqa: BLE001
-        await show(cb.bot, cb.message.chat.id, state, intro(settings), intro_kb(payments_on=settings.payments_enabled))
+        await present(
+            cb.bot,
+            cb.message.chat.id,
+            state,
+            intro(settings),
+            reply_menu=_menu(settings, cb.from_user.id),
+            inline=intro_kb(payments_on=settings.payments_enabled),
+        )
 
 
 @router.message(Command("help", "support"))
-@router.message(F.text == "❓ Support")
+@router.message(F.text.in_({"❓ Yordam", "❓ Support"}))
 @router.callback_query(F.data == "ux:support")
 async def ux_support(event: Message | CallbackQuery, state: FSMContext, settings: Settings) -> None:
     if isinstance(event, CallbackQuery):
@@ -125,7 +138,7 @@ async def ux_support(event: Message | CallbackQuery, state: FSMContext, settings
     )
 
 
-@router.message(F.text == "⚙️ Settings")
+@router.message(F.text.in_({"⚙️ Settings", "⚙️ Sozlamalar"}))
 async def ux_settings(message: Message, state: FSMContext, settings: Settings) -> None:
     u = message.from_user
     await safe_delete_message(message)
@@ -144,13 +157,19 @@ async def cmd_cancel(message: Message, state: FSMContext, settings: Settings) ->
     u = message.from_user
     await safe_delete_message(message)
     await state.clear()
-    await show(message.bot, message.chat.id, state, "Cancelled.", _menu(settings, u.id if u else None))
+    await show(
+        message.bot,
+        message.chat.id,
+        state,
+        "Bekor qilindi.\nMenyudan davom eting 👇",
+        _menu(settings, u.id if u else None),
+    )
 
 
 # ── Subscription ───────────────────────────────────────
 
 @router.message(Command("subscription", "renew"))
-@router.message(F.text == "💎 Subscription")
+@router.message(F.text.in_({"💎 Subscription", "💎 Obuna"}))
 @router.callback_query(F.data.in_({"ux:sub", "ux:renew", "ux:pay"}))
 async def ux_subscription(
     event: Message | CallbackQuery,
@@ -173,25 +192,33 @@ async def ux_subscription(
     await billing.ensure_user(u.id, u.username, u.full_name)
     panel = await billing.get_panel(u.id)
     sub = panel.get("subscription")
-    text = subscription_card(
-        settings,
-        status=sub.status if sub else None,
-        days_left=panel.get("days_left"),
-        expires=_exp_str(sub),
-    )
 
     if data == "ux:pay" or (data == "ux:renew" and settings.payments_enabled):
         if settings.payments_enabled:
             payload = await billing.create_invoice_payload(u.id, purpose="renewal")
             await billing.send_stars_invoice(msg.bot, msg.chat.id, payload)
-            await msg.answer(
-                f"<b>Invoice sent</b>\n\n⭐ {settings.subscription_price_stars} Stars · {settings.subscription_days} days",
-            )
+            await msg.answer(payment_sent(settings))
             return
-        await msg.answer("Test mode: payments are off. Use Create Bot.")
+        await msg.answer("🧪 Test rejim: to‘lov o‘chiq.\n✨ Bot ochish orqali davom eting.")
         return
 
-    await show(msg.bot, msg.chat.id, state, text, sub_kb(payments_on=settings.payments_enabled))
+    # Pricing pitch if no sub, card if has sub
+    if not sub:
+        text = pricing_pitch(settings)
+    else:
+        text = subscription_card(
+            settings,
+            status=sub.status if sub else None,
+            days_left=panel.get("days_left"),
+            expires=_exp_str(sub),
+        )
+    await show(
+        msg.bot,
+        msg.chat.id,
+        state,
+        text,
+        sub_kb(payments_on=settings.payments_enabled, price=settings.subscription_price_stars),
+    )
 
 
 @router.pre_checkout_query()
@@ -231,9 +258,7 @@ async def on_paid(
                     logger.exception("reactivate failed")
         await state.set_state(DeployStates.waiting_token)
         await state.update_data(subscription_id=sub.id if sub else None, deploying=False)
-        await message.answer(
-            "<b>Payment successful</b>\n\nYour plan is active.\nSend your BotFather token to deploy or update."
-        )
+        await message.answer(payment_ok())
         await message.answer(ask_token())
     except Exception as e:  # noqa: BLE001
         logger.exception("payment activate")
@@ -254,9 +279,7 @@ async def _begin_create(message: Message, state: FSMContext, billing: BillingSer
         if not sub or sub.status not in {"active", "grace"}:
             payload = await billing.create_invoice_payload(user.id)
             await billing.send_stars_invoice(message.bot, message.chat.id, payload)
-            await message.answer(
-                f"<b>Subscribe to continue</b>\n\n⭐ {settings.subscription_price_stars} Stars · {settings.subscription_days} days"
-            )
+            await message.answer(payment_sent(settings))
             return
     else:
         res = await billing.grant_test_subscription(user.id)
@@ -270,7 +293,7 @@ async def _begin_create(message: Message, state: FSMContext, billing: BillingSer
 
 
 @router.message(Command("create", "open", "buy"))
-@router.message(F.text.in_({"✨ Create Bot", "🚀 Ochish"}))
+@router.message(F.text.in_({"✨ Create Bot", "🚀 Ochish", "✨ Bot ochish"}))
 @router.callback_query(F.data == "ux:create")
 async def ux_create(event: Message | CallbackQuery, state: FSMContext, billing: BillingService, settings: Settings) -> None:
     if isinstance(event, CallbackQuery):
@@ -304,7 +327,7 @@ async def on_token(
         await state.set_state(DeployStates.waiting_token)
         return
     if u.id in _active:
-        await message.answer("A deployment is already in progress.")
+        await message.answer("⏳ Deploy allaqachon ketmoqda. Biroz kuting…")
         return
 
     panel = await billing.get_panel(u.id)
@@ -318,11 +341,14 @@ async def on_token(
             res = await billing.grant_test_subscription(u.id)
             sub, db_user = res["subscription"], res["user"]
         else:
-            await message.answer("Active subscription required.", reply_markup=sub_kb(payments_on=True))
+            await message.answer(
+                "💎 Avval obuna kerak.",
+                reply_markup=sub_kb(payments_on=True, price=settings.subscription_price_stars),
+            )
             await state.clear()
             return
 
-    progress_msg = await message.answer(deploy_progress(1, "Checking token…"))
+    progress_msg = await message.answer(deploy_progress(1, "Token tekshirilmoqda…"))
     _active.add(u.id)
     await state.set_state(None)
     await state.update_data(deploying=True)
@@ -415,7 +441,7 @@ async def _bg_deploy(
         sub = panel.get("subscription")
         await edit(
             deploy_done(identity.username, settings.subscription_days, _exp_str(sub)),
-            bot_actions_kb(dep_id),
+            after_success_kb(dep_id),
         )
         logger.info("DEPLOY OK user=%s dep=%s", tg_id, dep_id)
     except Exception as e:  # noqa: BLE001
@@ -432,7 +458,7 @@ async def _bg_deploy(
 # ── My Bots ────────────────────────────────────────────
 
 @router.message(Command("bots", "mybots", "status"))
-@router.message(F.text.in_({"🤖 My Bots", "📊 Status", "🎛 Boshqaruv"}))
+@router.message(F.text.in_({"🤖 My Bots", "🤖 Botlarim", "📊 Status", "🎛 Boshqaruv"}))
 @router.callback_query(F.data.startswith("ux:bots"))
 async def ux_bots(
     event: Message | CallbackQuery,
@@ -456,8 +482,8 @@ async def ux_bots(
             msg.bot,
             msg.chat.id,
             state,
-            "<b>My Bots</b>\n\nNo bots yet.\nCreate your first deployment.",
-            intro_kb(payments_on=settings.payments_enabled),
+            empty_bots(),
+            empty_bots_kb(payments_on=settings.payments_enabled),
         )
         return
     await _show_bot_card(msg, state, billing, deploy, settings, u.id, dep.id, engine=deploy)
@@ -482,8 +508,8 @@ async def _show_bot_card(
             msg.bot,
             msg.chat.id,
             state,
-            "This bot is no longer available.",
-            intro_kb(payments_on=settings.payments_enabled),
+            "🔍 Bu bot endi mavjud emas.\nYangi bot ochishingiz mumkin.",
+            empty_bots_kb(payments_on=settings.payments_enabled),
         )
         return
     eng = engine or deploy
@@ -505,7 +531,13 @@ async def _show_bot_card(
         db_size=metrics["db_size"],
         last_backup=metrics["last_backup"],
     )
-    await show(msg.bot, msg.chat.id, state, text, bot_actions_kb(dep.id))
+    await show(
+        msg.bot,
+        msg.chat.id,
+        state,
+        text,
+        bot_actions_kb(dep.id, status=dep.status),
+    )
 
 
 @router.callback_query(F.data.startswith("bot:view:"))
@@ -523,7 +555,7 @@ async def bot_view(
     panel = await billing.get_panel(cb.from_user.id)
     dep = panel.get("deployment")
     if not dep or dep.id != dep_id:
-        await cb.message.answer("You can only manage your own bot.")
+        await cb.message.answer("🚫 Faqat o‘z botingizni boshqara olasiz.")
         return
     await _show_bot_card(cb.message, state, billing, deploy, settings, cb.from_user.id, dep_id, engine=deploy)
 
@@ -547,7 +579,7 @@ async def bot_actions(
     panel = await billing.get_panel(cb.from_user.id)
     dep = panel.get("deployment")
     if not dep or dep.id != dep_id:
-        await cb.message.answer("Access denied.")
+        await cb.message.answer("🚫 Ruxsat yo‘q.")
         return
 
     if action == "delask":
@@ -560,34 +592,37 @@ async def bot_actions(
     try:
         if action == "start":
             if dep.status == "suspended":
-                await cb.message.answer("Bot is suspended. Renew your subscription first.", reply_markup=sub_kb(payments_on=settings.payments_enabled))
+                await cb.message.answer(
+                    "🔴 Bot suspend.\nAvval obunani yangilang.",
+                    reply_markup=sub_kb(payments_on=settings.payments_enabled, price=settings.subscription_price_stars),
+                )
                 return
             await deploy.start(dep_id)
-            note = "Bot started."
+            note = "Bot ishga tushdi"
         elif action == "stop":
             await deploy.stop(dep_id)
-            note = "Bot stopped."
+            note = "Bot to‘xtatildi"
         elif action == "restart":
             await deploy.restart(dep_id)
-            note = "Bot restarted."
+            note = "Bot qayta ishga tushdi"
         elif action == "backup":
             path = await deploy.backup(dep_id)
-            note = f"Backup saved: <code>{path.name}</code>"
+            note = f"Backup saqlandi: <code>{path.name}</code>"
         elif action == "logs":
             text = await deploy.read_logs(dep_id, 25)
             safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            await cb.message.answer(f"<pre>{safe[-2500:]}</pre>" if safe else "No logs yet.")
+            await cb.message.answer(f"<pre>{safe[-2500:]}</pre>" if safe else "Log hali yo‘q.")
             return
         elif action == "delok":
             await deploy.purge(dep_id)
             await cb.message.edit_text(
-                "<b>Bot deleted</b>\n\nAll data has been permanently removed.",
-                reply_markup=intro_kb(payments_on=settings.payments_enabled),
+                "🗑 <b>Bot o‘chirildi</b>\n\nBarcha ma’lumotlar butunlay olib tashlandi.",
+                reply_markup=empty_bots_kb(payments_on=settings.payments_enabled),
             )
             return
         else:
             return
-        await cb.message.answer(f"✅ {note}")
+        await cb.answer(f"✅ {note}", show_alert=False)
         await _show_bot_card(cb.message, state, billing, deploy, settings, cb.from_user.id, dep_id, engine=deploy)
     except Exception as e:  # noqa: BLE001
         logger.exception("bot action")
@@ -597,7 +632,7 @@ async def bot_actions(
 # ── Dashboard ──────────────────────────────────────────
 
 @router.message(Command("dashboard"))
-@router.message(F.text == "📊 Dashboard")
+@router.message(F.text.in_({"📊 Dashboard", "📊 Kabinet"}))
 async def ux_dashboard(message: Message, state: FSMContext, billing: BillingService, settings: Settings) -> None:
     u = message.from_user
     if not u:

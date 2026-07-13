@@ -151,12 +151,20 @@ class BillingService:
     async def send_stars_invoice(self, bot: Bot, chat_id: int, payload: str) -> None:
         await bot.send_invoice(
             chat_id=chat_id,
-            title=f"{self.settings.brand_name} obuna",
-            description=f"Mafia bot hosting — {self.settings.subscription_days} kun",
+            title=f"{self.settings.brand_name} · Premium",
+            description=(
+                f"Mafia bot hosting {self.settings.subscription_days} kun · "
+                f"avtomatik deploy, backup, support"
+            ),
             payload=payload,
             provider_token="",
             currency="XTR",
-            prices=[LabeledPrice(label="30 kun", amount=self.settings.subscription_price_stars)],
+            prices=[
+                LabeledPrice(
+                    label=f"{self.settings.subscription_days} kun hosting",
+                    amount=self.settings.subscription_price_stars,
+                )
+            ],
         )
 
     async def activate_from_payment(

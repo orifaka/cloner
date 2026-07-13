@@ -39,14 +39,56 @@ async def show(
     reply_markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | None = None,
     *,
     wipe: bool = True,
+    disable_preview: bool = True,
 ) -> Message:
     if wipe:
         await wipe_ui(bot, chat_id, state)
-    msg = await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    msg = await bot.send_message(
+        chat_id,
+        text,
+        reply_markup=reply_markup,
+        disable_web_page_preview=disable_preview,
+    )
     data = await state.get_data()
     ids = list(data.get("ui_ids") or [])
     ids.append(msg.message_id)
-    await state.update_data(ui_ids=ids[-4:])
+    await state.update_data(ui_ids=ids[-3:])
+    return msg
+
+
+async def present(
+    bot: Bot,
+    chat_id: int,
+    state: FSMContext,
+    text: str,
+    *,
+    reply_menu: ReplyKeyboardMarkup | None = None,
+    inline: InlineKeyboardMarkup | None = None,
+    wipe: bool = True,
+) -> Message:
+    """
+    Premium pattern: set reply keyboard (if any) + one content message with inline CTAs.
+    Avoids double cluttered screens.
+    """
+    if wipe:
+        await wipe_ui(bot, chat_id, state)
+    if reply_menu is not None:
+        # lightweight keyboard sync (deleted immediately if possible)
+        tip = await bot.send_message(chat_id, "‎", reply_markup=reply_menu)
+        try:
+            await tip.delete()
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
+    msg = await bot.send_message(
+        chat_id,
+        text,
+        reply_markup=inline,
+        disable_web_page_preview=True,
+    )
+    data = await state.get_data()
+    ids = list(data.get("ui_ids") or [])
+    ids.append(msg.message_id)
+    await state.update_data(ui_ids=ids[-3:])
     return msg
 
 
