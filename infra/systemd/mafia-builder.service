@@ -1,0 +1,22 @@
+[Unit]
+Description=Mafia Builder SaaS Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mafiabot
+Group=mafiabot
+WorkingDirectory=/opt/mafia-builder
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/mafia-builder/.env
+ExecStart=/opt/mafia-builder/.venv/bin/python -u apps/builder-bot/main.py
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+StandardOutput=append:/opt/mafia-builder/data/builder.out.log
+StandardError=append:/opt/mafia-builder/data/builder.err.log
+
+[Install]
+WantedBy=multi-user.target
