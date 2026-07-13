@@ -1,6 +1,7 @@
-# Resolved runtime for tenant Mafia bots.
-# Platform-owned file — does NOT modify template/mafia-bot source.
-# starlette pin removed: fastapi 0.115.x pulls a compatible starlette itself.
+# Packages needed to RUN tenant Mafia bots (template).
+# Install once into the SAME venv as main.py:
+#   pip install -r infra/mafia-runtime-requirements.txt
+# On shared hosting we reuse host python — no second venv.
 
 aiogram==3.22.0
 SQLAlchemy==2.0.44
