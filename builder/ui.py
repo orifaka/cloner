@@ -68,23 +68,49 @@ async def present(
 ) -> Message:
     """
     Premium pattern: set reply keyboard (if any) + one content message with inline CTAs.
-    Avoids double cluttered screens.
+    Telegram rejects empty/invisible-only messages — never send blank text.
     """
     if wipe:
         await wipe_ui(bot, chat_id, state)
-    if reply_menu is not None:
-        # lightweight keyboard sync (deleted immediately if possible)
-        tip = await bot.send_message(chat_id, "‎", reply_markup=reply_menu)
+
+    content = (text or "").strip() or "—"
+
+    # If only reply keyboard: one message
+    if reply_menu is not None and inline is None:
+        msg = await bot.send_message(
+            chat_id,
+            content,
+            reply_markup=reply_menu,
+            disable_web_page_preview=True,
+        )
+    # If only inline: one message
+    elif reply_menu is None and inline is not None:
+        msg = await bot.send_message(
+            chat_id,
+            content,
+            reply_markup=inline,
+            disable_web_page_preview=True,
+        )
+    # Both: set bottom menu with a short visible tip, then content+inline
+    elif reply_menu is not None and inline is not None:
+        tip = await bot.send_message(chat_id, "⬇️ Menyudan tanlang", reply_markup=reply_menu)
         try:
             await tip.delete()
         except (TelegramBadRequest, TelegramForbiddenError):
             pass
-    msg = await bot.send_message(
-        chat_id,
-        text,
-        reply_markup=inline,
-        disable_web_page_preview=True,
-    )
+        msg = await bot.send_message(
+            chat_id,
+            content,
+            reply_markup=inline,
+            disable_web_page_preview=True,
+        )
+    else:
+        msg = await bot.send_message(
+            chat_id,
+            content,
+            disable_web_page_preview=True,
+        )
+
     data = await state.get_data()
     ids = list(data.get("ui_ids") or [])
     ids.append(msg.message_id)
