@@ -11,7 +11,7 @@ from pathlib import Path
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message, PreCheckoutQuery
+from aiogram.types import CallbackQuery, FSInputFile, Message, PreCheckoutQuery
 
 from builder.admin import router as admin_router
 from builder.billing import BillingService, as_utc
