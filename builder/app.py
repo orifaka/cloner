@@ -67,13 +67,31 @@ async def run_bot() -> None:
     settings = get_settings()
     logger.info("=== start === payments=%s template=%s", settings.payments_enabled, settings.template_dir)
 
+    token = (settings.builder_bot_token or "").strip()
+    if not token or token.startswith("123456") or "REPLACE" in token.upper() or "CHANGE" in token.upper():
+        raise SystemExit(
+            "BUILDER_BOT_TOKEN yaroqsiz yoki joylanmagan.\n"
+            ".env faylida BotFather dan olingan YANGI token yozing:\n"
+            "  BUILDER_BOT_TOKEN=123456789:AA...\n"
+            "Keyin: python main.py"
+        )
+
     await init_db(settings)
     sf = get_session_factory(settings)
     billing = BillingService(settings, sf)
     deploy = DeploymentEngine(settings, sf)
 
-    bot = Bot(settings.builder_bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    me = await bot.get_me()
+    bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    try:
+        me = await bot.get_me()
+    except Exception as e:
+        await bot.session.close()
+        await close_db()
+        raise SystemExit(
+            f"Telegram token ishlamayapti: {e}\n"
+            "BotFather → API Token → Revoke/Generate yangi token.\n"
+            ".env → BUILDER_BOT_TOKEN=... yangilang, keyin qayta ishga tushiring."
+        ) from e
     if me.username:
         settings.builder_bot_username = me.username
     logger.info("online @%s id=%s", me.username, me.id)

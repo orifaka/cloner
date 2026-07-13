@@ -20,13 +20,15 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(32), default="user")
     is_blocked: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    # Growth
     referral_code: Mapped[Optional[str]] = mapped_column(String(32), unique=True, nullable=True, index=True)
     referred_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    credit_stars: Mapped[int] = mapped_column(Integer, default=0)  # discount balance
-    referral_paid: Mapped[bool] = mapped_column(Boolean, default=False)  # invitee already rewarded referrer
+    credit_stars: Mapped[int] = mapped_column(Integer, default=0)
+    referral_paid: Mapped[bool] = mapped_column(Boolean, default=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
     subscriptions: Mapped[list[Subscription]] = relationship(back_populates="user")
     deployments: Mapped[list[Deployment]] = relationship(back_populates="user")
@@ -38,15 +40,22 @@ class Subscription(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    # legacy NOT NULL column in existing DBs — always set a default
+    plan_code: Mapped[str] = mapped_column(String(64), default="monthly_stars", server_default="monthly_stars")
     price_stars: Mapped[int] = mapped_column(Integer, default=300)
     starts_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     grace_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    auto_renew: Mapped[bool] = mapped_column(Boolean, default=False)
     reminder_7d_sent: Mapped[bool] = mapped_column(Boolean, default=False)
     reminder_3d_sent: Mapped[bool] = mapped_column(Boolean, default=False)
     reminder_24h_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    expired_notice_sent: Mapped[bool] = mapped_column(Boolean, default=False)
     last_daily_reminder_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
     user: Mapped[User] = relationship(back_populates="subscriptions")
     deployment: Mapped[Optional[Deployment]] = relationship(back_populates="subscription", uselist=False)
@@ -58,7 +67,9 @@ class Payment(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    subscription_id: Mapped[Optional[int]] = mapped_column(ForeignKey("subscriptions.id", ondelete="SET NULL"), nullable=True)
+    subscription_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("subscriptions.id", ondelete="SET NULL"), nullable=True
+    )
     purpose: Mapped[str] = mapped_column(String(32), default="new_subscription")
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     amount_stars: Mapped[int] = mapped_column(Integer, default=300)
@@ -66,6 +77,7 @@ class Payment(Base):
     telegram_payment_charge_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     provider_payment_charge_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     payload: Mapped[str] = mapped_column(String(255), default="")
+    raw_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -90,9 +102,12 @@ class Deployment(Base):
     bot_first_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     project_path: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    container_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    container_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     process_pid: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     db_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     database_url_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    redis_namespace: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     last_heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -100,6 +115,9 @@ class Deployment(Base):
     suspended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
     user: Mapped[User] = relationship(back_populates="deployments")
     subscription: Mapped[Optional[Subscription]] = relationship(back_populates="deployment")

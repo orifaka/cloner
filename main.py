@@ -60,6 +60,12 @@ def main() -> None:
         asyncio.run(run_bot())
     except KeyboardInterrupt:
         log.info("interrupted")
+    except SystemExit as e:
+        log.error("%s", e)
+        raise
+    except Exception:
+        log.exception("Bot ishga tushmadi")
+        raise
 
 
 if __name__ == "__main__":

@@ -241,15 +241,23 @@ class BillingService:
             ).scalars().first()
             now = utcnow()
             if not sub or sub.status in {"expired", "cancelled"}:
-                sub = Subscription(user_id=u.id, price_stars=0)
+                sub = Subscription(
+                    user_id=u.id,
+                    price_stars=0,
+                    plan_code="monthly_stars",
+                    auto_renew=False,
+                    expired_notice_sent=False,
+                )
                 s.add(sub)
             sub.status = "active"
+            sub.plan_code = sub.plan_code or "monthly_stars"
             sub.starts_at = sub.starts_at or now
             sub.expires_at = now + timedelta(days=self.settings.subscription_days)
             grace_days = getattr(self.settings, "grace_period_days", 7) or 7
             sub.grace_until = sub.expires_at + timedelta(days=grace_days)
             sub.price_stars = 0 if not self.settings.payments_enabled else sub.price_stars
             sub.reminder_7d_sent = sub.reminder_3d_sent = sub.reminder_24h_sent = False
+            sub.expired_notice_sent = False
             sub.last_daily_reminder_at = None
             await s.commit()
             await s.refresh(sub)
@@ -284,9 +292,16 @@ class BillingService:
                 )
             ).scalars().first()
             if not sub or sub.status in {"expired", "cancelled"}:
-                sub = Subscription(user_id=u.id, price_stars=amount)
+                sub = Subscription(
+                    user_id=u.id,
+                    price_stars=amount,
+                    plan_code="monthly_stars",
+                    auto_renew=False,
+                    expired_notice_sent=False,
+                )
                 s.add(sub)
                 await s.flush()
+            sub.plan_code = getattr(sub, "plan_code", None) or "monthly_stars"
             payload = f"sub:{sub.id}:u:{u.id}:p:{purpose}:a:{amount}:{int(utcnow().timestamp())}"
             s.add(
                 Payment(
