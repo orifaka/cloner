@@ -38,13 +38,28 @@ async def _on_error(event: ErrorEvent) -> bool:
     exc = event.exception
     if isinstance(exc, TelegramBadRequest):
         m = str(exc).lower()
-        if any(x in m for x in ("query is too old", "message is not modified", "message to edit not found")):
+        if any(x in m for x in ("query is too old", "message is not modified", "message to edit not found", "message to delete not found")):
             logger.warning("soft: %s", exc)
             return True
     if isinstance(exc, (TelegramForbiddenError, TelegramRetryAfter)):
         logger.warning("soft: %s", exc)
         return True
+    # Never leak stack traces to users — only log server-side
     logger.exception("error: %s", exc)
+    try:
+        upd = event.update
+        chat_id = None
+        if upd.message and upd.message.chat:
+            chat_id = upd.message.chat.id
+        elif upd.callback_query and upd.callback_query.message:
+            chat_id = upd.callback_query.message.chat.id
+        if chat_id and event.bot:
+            from builder.copy import friendly_error
+            from builder.keyboards import after_error_kb
+
+            await event.bot.send_message(chat_id, friendly_error(exc), reply_markup=after_error_kb())
+    except Exception:  # noqa: BLE001
+        pass
     return True
 
 

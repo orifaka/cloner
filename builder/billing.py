@@ -108,9 +108,11 @@ class BillingService:
             sub.status = "active"
             sub.starts_at = sub.starts_at or now
             sub.expires_at = now + timedelta(days=self.settings.subscription_days)
-            sub.grace_until = sub.expires_at + timedelta(hours=self.settings.grace_period_hours)
-            sub.price_stars = 0
+            grace_days = getattr(self.settings, "grace_period_days", 7) or 7
+            sub.grace_until = sub.expires_at + timedelta(days=grace_days)
+            sub.price_stars = 0 if not self.settings.payments_enabled else sub.price_stars
             sub.reminder_7d_sent = sub.reminder_3d_sent = sub.reminder_24h_sent = False
+            sub.last_daily_reminder_at = None
             await s.commit()
             await s.refresh(sub)
             logger.info("test sub granted user=%s exp=%s", telegram_id, sub.expires_at)
@@ -184,8 +186,10 @@ class BillingService:
             sub.status = "active"
             sub.starts_at = sub.starts_at or now
             sub.expires_at = (as_utc(base) or now) + timedelta(days=self.settings.subscription_days)
-            sub.grace_until = sub.expires_at + timedelta(hours=self.settings.grace_period_hours)
+            grace_days = getattr(self.settings, "grace_period_days", 7) or 7
+            sub.grace_until = sub.expires_at + timedelta(days=grace_days)
             sub.reminder_7d_sent = sub.reminder_3d_sent = sub.reminder_24h_sent = False
+            sub.last_daily_reminder_at = None
             await s.commit()
             await s.refresh(sub)
             return {"payment": pay, "subscription": sub, "already": False}
@@ -237,6 +241,9 @@ class BillingService:
             ).scalar_one_or_none()
 
     async def process_lifecycle(self, bot: Bot, deploy_engine) -> None:
+        from builder.copy import remind_24h, remind_3d, remind_7d, remind_expired, remind_grace_daily
+
+        grace_days = getattr(self.settings, "grace_period_days", 7) or 7
         async with self.sf() as s:
             subs = (
                 await s.execute(
@@ -255,6 +262,7 @@ class BillingService:
                 left = exp - now
                 days = left.total_seconds() / 86400
                 cid = sub.user.telegram_id
+                dep = sub.deployment
 
                 async def note(text: str, _c=cid) -> None:
                     try:
@@ -264,34 +272,46 @@ class BillingService:
 
                 if sub.status == "active":
                     if 0 < days <= 1 and not sub.reminder_24h_sent:
-                        await note("⏰ 24 soat qoldi. /renew")
+                        await note(remind_24h(self.settings))
                         sub.reminder_24h_sent = True
                     elif 1 < days <= 3 and not sub.reminder_3d_sent:
-                        await note("⏰ 3 kun qoldi. /renew")
+                        await note(remind_3d(self.settings))
                         sub.reminder_3d_sent = True
                     elif 3 < days <= 7 and not sub.reminder_7d_sent:
-                        await note("📅 7 kun qoldi. /renew")
+                        await note(remind_7d(self.settings))
                         sub.reminder_7d_sent = True
+
+                    # Expire day: suspend immediately + 7-day grace before purge
                     if left.total_seconds() <= 0:
-                        grace = as_utc(sub.grace_until) or exp + timedelta(hours=self.settings.grace_period_hours)
-                        if now <= grace:
-                            sub.status = "grace"
-                            await note("⚠️ Muddati tugadi. /renew")
-                        else:
-                            sub.status = "expired"
-                            if sub.deployment:
-                                await deploy_engine.suspend(sub.deployment.id)
-                            await note("🛑 Suspend. /renew")
+                        sub.status = "grace"
+                        sub.grace_until = exp + timedelta(days=grace_days)
+                        if dep and dep.status not in {"deleted", "suspended"}:
+                            await deploy_engine.suspend(dep.id)
+                        await note(remind_expired(self.settings))
+
                 elif sub.status == "grace":
-                    grace = as_utc(sub.grace_until) or exp
-                    if now > grace:
+                    grace_until = as_utc(sub.grace_until) or exp + timedelta(days=grace_days)
+                    remaining_grace = grace_until - now
+                    if remaining_grace.total_seconds() <= 0:
                         sub.status = "expired"
-                        if sub.deployment:
-                            await deploy_engine.suspend(sub.deployment.id)
-                        await note("🛑 Suspend. /renew")
+                        if dep and dep.status != "deleted":
+                            await deploy_engine.purge(dep.id)
+                        await note(
+                            "<b>Bot removed</b>\n\n"
+                            "The 7-day grace period ended without payment.\n"
+                            "Your deployment was permanently deleted.\n"
+                            "Create a new bot anytime from the menu."
+                        )
+                    else:
+                        last = as_utc(sub.last_daily_reminder_at)
+                        if not last or (now - last) >= timedelta(days=1):
+                            dleft = max(1, int(remaining_grace.total_seconds() // 86400))
+                            await note(remind_grace_daily(dleft))
+                            sub.last_daily_reminder_at = now
+
                 elif sub.status == "expired":
-                    last = as_utc(sub.last_daily_reminder_at)
-                    if not last or (now - last) >= timedelta(days=1):
-                        await note("📢 Suspend. /renew")
-                        sub.last_daily_reminder_at = now
+                    # ensure purged if still present
+                    if dep and dep.status not in {"deleted"}:
+                        await deploy_engine.purge(dep.id)
+
                 await s.commit()

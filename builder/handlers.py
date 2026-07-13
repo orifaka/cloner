@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import datetime, timezone
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart, StateFilter
@@ -11,25 +12,32 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message, PreCheckoutQuery
 
 from builder.admin import router as admin_router
-from builder.billing import BillingService
+from builder.billing import BillingService, as_utc
 from builder.config import Settings
+from builder.copy import (
+    ask_token,
+    bot_card,
+    dashboard,
+    delete_warning,
+    deploy_done,
+    deploy_progress,
+    fmt_dt,
+    friendly_error,
+    help_text,
+    intro,
+    settings_text,
+    subscription_card,
+)
 from builder.deploy import DeploymentEngine, TokenError
-from builder.keyboards import control_kb, home_inline, main_menu, status_kb
-from builder.texts import (
-    t_ask_token,
-    t_busy,
-    t_cancelled,
-    t_checking,
-    t_deploying,
-    t_failed,
-    t_help,
-    t_home,
-    t_invalid,
-    t_need_sub,
-    t_no_bot,
-    t_progress,
-    t_ready,
-    t_status,
+from builder.keyboards import (
+    after_error_kb,
+    bot_actions_kb,
+    bots_list_kb,
+    confirm_kb,
+    intro_kb,
+    main_menu,
+    sub_kb,
+    support_kb,
 )
 from builder.ui import replace_message, safe_cb, safe_delete_message, show
 
@@ -45,15 +53,21 @@ class DeployStates(StatesGroup):
     waiting_token = State()
 
 
-def _is_admin(uid: int, settings: Settings) -> bool:
-    return uid in settings.admin_telegram_ids
+def _admin(uid: int, s: Settings) -> bool:
+    return uid in s.admin_telegram_ids
 
 
-def _menu(settings: Settings, uid: int | None = None) -> object:
-    return main_menu(is_admin=bool(uid and _is_admin(uid, settings)))
+def _menu(s: Settings, uid: int | None) -> object:
+    return main_menu(is_admin=bool(uid and _admin(uid, s)))
 
 
-# ── start / nav ────────────────────────────────────────
+def _exp_str(sub) -> str | None:
+    if not sub or not sub.expires_at:
+        return None
+    return fmt_dt(as_utc(sub.expires_at))
+
+
+# ── Home ───────────────────────────────────────────────
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, billing: BillingService, settings: Settings) -> None:
@@ -63,33 +77,64 @@ async def cmd_start(message: Message, state: FSMContext, billing: BillingService
         return
     await billing.ensure_user(u.id, u.username, u.full_name, u.language_code or settings.default_language)
     await safe_delete_message(message)
-    is_adm = _is_admin(u.id, settings)
     await show(
         message.bot,
         message.chat.id,
         state,
-        t_home(settings, is_admin=is_adm),
+        intro(settings),
         _menu(settings, u.id),
         wipe=False,
     )
     await message.bot.send_message(
         message.chat.id,
-        "Quyidagidan tanlang 👇",
-        reply_markup=home_inline(payments_enabled=settings.payments_enabled),
+        "Choose an action:",
+        reply_markup=intro_kb(payments_on=settings.payments_enabled),
     )
-    logger.info("start user=%s admin=%s", u.id, is_adm)
 
 
-@router.message(Command("help"))
-@router.message(F.text.in_({"ℹ️ Yordam", "🆘 Support"}))
-async def cmd_help(message: Message, state: FSMContext, settings: Settings) -> None:
+@router.callback_query(F.data == "ux:home")
+async def ux_home(cb: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    await safe_cb(cb)
+    if not cb.message or not cb.from_user:
+        return
+    await state.clear()
+    try:
+        await cb.message.edit_text(intro(settings), reply_markup=intro_kb(payments_on=settings.payments_enabled))
+    except Exception:  # noqa: BLE001
+        await show(cb.bot, cb.message.chat.id, state, intro(settings), intro_kb(payments_on=settings.payments_enabled))
+
+
+@router.message(Command("help", "support"))
+@router.message(F.text == "❓ Support")
+@router.callback_query(F.data == "ux:support")
+async def ux_support(event: Message | CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    if isinstance(event, CallbackQuery):
+        await safe_cb(event)
+        msg, u = event.message, event.from_user
+    else:
+        await safe_delete_message(event)
+        msg, u = event, event.from_user
+    if not msg:
+        return
+    await show(
+        msg.bot,
+        msg.chat.id,
+        state,
+        help_text(settings),
+        support_kb(settings.support_url),
+    )
+
+
+@router.message(F.text == "⚙️ Settings")
+async def ux_settings(message: Message, state: FSMContext, settings: Settings) -> None:
     u = message.from_user
     await safe_delete_message(message)
+    lang = u.language_code if u else "uz"
     await show(
         message.bot,
         message.chat.id,
         state,
-        t_help(settings),
+        settings_text(settings, lang or "uz"),
         _menu(settings, u.id if u else None),
     )
 
@@ -99,170 +144,144 @@ async def cmd_cancel(message: Message, state: FSMContext, settings: Settings) ->
     u = message.from_user
     await safe_delete_message(message)
     await state.clear()
-    await show(message.bot, message.chat.id, state, t_cancelled(), _menu(settings, u.id if u else None))
+    await show(message.bot, message.chat.id, state, "Cancelled.", _menu(settings, u.id if u else None))
 
 
-@router.callback_query(F.data == "nav:home")
-async def nav_home(callback: CallbackQuery, state: FSMContext, settings: Settings) -> None:
-    await safe_cb(callback)
-    u = callback.from_user
-    if not callback.message or not u:
+# ── Subscription ───────────────────────────────────────
+
+@router.message(Command("subscription", "renew"))
+@router.message(F.text == "💎 Subscription")
+@router.callback_query(F.data.in_({"ux:sub", "ux:renew", "ux:pay"}))
+async def ux_subscription(
+    event: Message | CallbackQuery,
+    state: FSMContext,
+    billing: BillingService,
+    settings: Settings,
+    deploy: DeploymentEngine,
+) -> None:
+    if isinstance(event, CallbackQuery):
+        await safe_cb(event)
+        msg, u = event.message, event.from_user
+        data = event.data
+    else:
+        await safe_delete_message(event)
+        msg, u = event, event.from_user
+        data = "ux:sub"
+    if not msg or not u:
         return
-    await state.clear()
-    is_adm = _is_admin(u.id, settings)
-    try:
-        await callback.message.edit_text(t_home(settings, is_admin=is_adm), reply_markup=home_inline(payments_enabled=settings.payments_enabled))
-    except Exception:  # noqa: BLE001
-        await show(
-            callback.bot,
-            callback.message.chat.id,
-            state,
-            t_home(settings, is_admin=is_adm),
-            home_inline(payments_enabled=settings.payments_enabled),
-        )
 
-
-@router.callback_query(F.data == "nav:help")
-async def nav_help(callback: CallbackQuery, settings: Settings) -> None:
-    await safe_cb(callback)
-    if callback.message:
-        await callback.message.answer(t_help(settings))
-
-
-@router.callback_query(F.data == "nav:open")
-async def nav_open(callback: CallbackQuery, state: FSMContext, billing: BillingService, settings: Settings) -> None:
-    await safe_cb(callback)
-    if not callback.message or not callback.from_user:
-        return
-    # reuse open flow via fake message path
-    await _open_flow(callback.message, state, billing, settings, callback.from_user)
-
-
-@router.callback_query(F.data == "nav:token")
-async def nav_token(callback: CallbackQuery, state: FSMContext, billing: BillingService, settings: Settings) -> None:
-    await safe_cb(callback)
-    if not callback.message or not callback.from_user:
-        return
-    u = callback.from_user
+    await billing.ensure_user(u.id, u.username, u.full_name)
     panel = await billing.get_panel(u.id)
     sub = panel.get("subscription")
-    if not sub or sub.status not in {"active", "grace"}:
-        if not settings.payments_enabled:
-            await billing.ensure_user(u.id, u.username, u.full_name)
-            res = await billing.grant_test_subscription(u.id)
-            sub = res["subscription"]
-        else:
-            await callback.message.answer(t_need_sub())
-            return
-    await state.set_state(DeployStates.waiting_token)
-    await state.update_data(subscription_id=sub.id, deploying=False)
-    await callback.message.answer(t_ask_token())
-
-
-@router.callback_query(F.data == "nav:status")
-@router.callback_query(F.data == "nav:panel")
-async def nav_status(callback: CallbackQuery, state: FSMContext, billing: BillingService, settings: Settings) -> None:
-    await safe_cb(callback)
-    if not callback.message or not callback.from_user:
-        return
-    await _send_status(callback.message, state, billing, settings, callback.from_user.id)
-
-
-# ── open / pay ─────────────────────────────────────────
-
-async def _open_flow(message: Message, state: FSMContext, billing: BillingService, settings: Settings, user) -> None:
-    if user.id in _active or (await state.get_data()).get("deploying"):
-        await show(message.bot, message.chat.id, state, t_busy(), _menu(settings, user.id))
-        return
-    await billing.ensure_user(user.id, user.username, user.full_name)
-
-    if not settings.payments_enabled:
-        res = await billing.grant_test_subscription(user.id)
-        await state.set_state(DeployStates.waiting_token)
-        await state.update_data(subscription_id=res["subscription"].id, deploying=False)
-        await show(message.bot, message.chat.id, state, t_ask_token(), _menu(settings, user.id))
-        logger.info("open test user=%s", user.id)
-        return
-
-    payload = await billing.create_invoice_payload(user.id)
-    await billing.send_stars_invoice(message.bot, message.chat.id, payload)
-    await show(
-        message.bot,
-        message.chat.id,
-        state,
-        f"⭐ <b>{settings.subscription_price_stars} Stars</b>\nTo'lovni tasdiqlang.",
-        _menu(settings, user.id),
+    text = subscription_card(
+        settings,
+        status=sub.status if sub else None,
+        days_left=panel.get("days_left"),
+        expires=_exp_str(sub),
     )
 
-
-@router.message(Command("buy", "open", "subscribe"))
-@router.message(F.text.in_({"🚀 Ochish", "🚀 Bot ochish"}))
-async def cmd_open(message: Message, state: FSMContext, billing: BillingService, settings: Settings) -> None:
-    u = message.from_user
-    if not u:
+    if data == "ux:pay" or (data == "ux:renew" and settings.payments_enabled):
+        if settings.payments_enabled:
+            payload = await billing.create_invoice_payload(u.id, purpose="renewal")
+            await billing.send_stars_invoice(msg.bot, msg.chat.id, payload)
+            await msg.answer(
+                f"<b>Invoice sent</b>\n\n⭐ {settings.subscription_price_stars} Stars · {settings.subscription_days} days",
+            )
+            return
+        await msg.answer("Test mode: payments are off. Use Create Bot.")
         return
-    await safe_delete_message(message)
-    await _open_flow(message, state, billing, settings, u)
 
-
-@router.message(Command("renew"))
-async def cmd_renew(message: Message, state: FSMContext, billing: BillingService, settings: Settings) -> None:
-    u = message.from_user
-    if not u:
-        return
-    await safe_delete_message(message)
-    if not settings.payments_enabled:
-        await _open_flow(message, state, billing, settings, u)
-        return
-    await billing.ensure_user(u.id, u.username, u.full_name)
-    payload = await billing.create_invoice_payload(u.id, purpose="renewal")
-    await billing.send_stars_invoice(message.bot, message.chat.id, payload)
+    await show(msg.bot, msg.chat.id, state, text, sub_kb(payments_on=settings.payments_enabled))
 
 
 @router.pre_checkout_query()
 async def pre_checkout(q: PreCheckoutQuery, settings: Settings) -> None:
     if not settings.payments_enabled:
-        await q.answer(ok=False, error_message="Test rejim")
+        await q.answer(ok=False, error_message="Payments are disabled in test mode.")
         return
     await q.answer(ok=True)
 
 
 @router.message(F.successful_payment)
-async def on_paid(message: Message, state: FSMContext, billing: BillingService, settings: Settings) -> None:
+async def on_paid(
+    message: Message,
+    state: FSMContext,
+    billing: BillingService,
+    settings: Settings,
+    deploy: DeploymentEngine,
+) -> None:
     if not settings.payments_enabled:
         return
     p = message.successful_payment
     if not p or p.currency != "XTR":
         return
-    res = await billing.activate_from_payment(p.invoice_payload, p.telegram_payment_charge_id, p.provider_payment_charge_id)
-    sub = res["subscription"]
-    await state.set_state(DeployStates.waiting_token)
-    await state.update_data(subscription_id=sub.id, deploying=False)
-    u = message.from_user
-    await show(message.bot, message.chat.id, state, t_ask_token(), _menu(settings, u.id if u else None))
-    logger.info("paid user=%s", u.id if u else "?")
-
-
-# ── token + deploy ─────────────────────────────────────
-
-@router.message(Command("token"))
-async def cmd_token(message: Message, state: FSMContext, billing: BillingService, settings: Settings) -> None:
-    u = message.from_user
-    if not u:
-        return
-    await safe_delete_message(message)
-    panel = await billing.get_panel(u.id)
-    sub = panel.get("subscription")
-    if not sub or sub.status not in {"active", "grace"}:
-        if settings.payments_enabled:
-            await show(message.bot, message.chat.id, state, t_need_sub(), _menu(settings, u.id))
-            return
-        await billing.ensure_user(u.id, u.username, u.full_name)
-        res = await billing.grant_test_subscription(u.id)
+    try:
+        res = await billing.activate_from_payment(
+            p.invoice_payload, p.telegram_payment_charge_id, p.provider_payment_charge_id
+        )
         sub = res["subscription"]
+        # restore suspended bot
+        if message.from_user:
+            panel = await billing.get_panel(message.from_user.id)
+            dep = panel.get("deployment")
+            if dep and dep.status == "suspended":
+                try:
+                    await deploy.start(dep.id)
+                except Exception:  # noqa: BLE001
+                    logger.exception("reactivate failed")
+        await state.set_state(DeployStates.waiting_token)
+        await state.update_data(subscription_id=sub.id if sub else None, deploying=False)
+        await message.answer(
+            "<b>Payment successful</b>\n\nYour plan is active.\nSend your BotFather token to deploy or update."
+        )
+        await message.answer(ask_token())
+    except Exception as e:  # noqa: BLE001
+        logger.exception("payment activate")
+        await message.answer(friendly_error(e), reply_markup=after_error_kb())
+
+
+# ── Create bot / token ─────────────────────────────────
+
+async def _begin_create(message: Message, state: FSMContext, billing: BillingService, settings: Settings, user) -> None:
+    if user.id in _active or (await state.get_data()).get("deploying"):
+        await message.answer("A deployment is already in progress. Please wait.")
+        return
+    await billing.ensure_user(user.id, user.username, user.full_name)
+
+    if settings.payments_enabled:
+        panel = await billing.get_panel(user.id)
+        sub = panel.get("subscription")
+        if not sub or sub.status not in {"active", "grace"}:
+            payload = await billing.create_invoice_payload(user.id)
+            await billing.send_stars_invoice(message.bot, message.chat.id, payload)
+            await message.answer(
+                f"<b>Subscribe to continue</b>\n\n⭐ {settings.subscription_price_stars} Stars · {settings.subscription_days} days"
+            )
+            return
+    else:
+        res = await billing.grant_test_subscription(user.id)
+        sub = res["subscription"]
+
+    panel = await billing.get_panel(user.id)
+    sub = panel.get("subscription") or sub
     await state.set_state(DeployStates.waiting_token)
-    await state.update_data(subscription_id=sub.id, deploying=False)
-    await show(message.bot, message.chat.id, state, t_ask_token(), _menu(settings, u.id))
+    await state.update_data(subscription_id=sub.id if sub else None, deploying=False)
+    await show(message.bot, message.chat.id, state, ask_token(), _menu(settings, user.id))
+
+
+@router.message(Command("create", "open", "buy"))
+@router.message(F.text.in_({"✨ Create Bot", "🚀 Ochish"}))
+@router.callback_query(F.data == "ux:create")
+async def ux_create(event: Message | CallbackQuery, state: FSMContext, billing: BillingService, settings: Settings) -> None:
+    if isinstance(event, CallbackQuery):
+        await safe_cb(event)
+        msg, u = event.message, event.from_user
+    else:
+        await safe_delete_message(event)
+        msg, u = event, event.from_user
+    if not msg or not u:
+        return
+    await _begin_create(msg, state, billing, settings, u)
 
 
 @router.message(StateFilter(DeployStates.waiting_token), F.text)
@@ -281,17 +300,11 @@ async def on_token(
     if raw.startswith("/"):
         return
     if not TOKEN_RE.match(raw):
-        await show(
-            message.bot,
-            message.chat.id,
-            state,
-            t_invalid("Format: <code>123456:AA...</code>"),
-            _menu(settings, u.id),
-        )
+        await message.answer(friendly_error("token format"), reply_markup=after_error_kb())
         await state.set_state(DeployStates.waiting_token)
         return
     if u.id in _active:
-        await show(message.bot, message.chat.id, state, t_busy(), _menu(settings, u.id))
+        await message.answer("A deployment is already in progress.")
         return
 
     panel = await billing.get_panel(u.id)
@@ -305,40 +318,42 @@ async def on_token(
             res = await billing.grant_test_subscription(u.id)
             sub, db_user = res["subscription"], res["user"]
         else:
-            await show(message.bot, message.chat.id, state, t_need_sub(), _menu(settings, u.id))
+            await message.answer("Active subscription required.", reply_markup=sub_kb(payments_on=True))
             await state.clear()
             return
 
-    msg = await show(message.bot, message.chat.id, state, t_checking(), _menu(settings, u.id))
+    progress_msg = await message.answer(deploy_progress(1, "Checking token…"))
+    _active.add(u.id)
+    await state.set_state(None)
+    await state.update_data(deploying=True)
+
     try:
         identity = await asyncio.wait_for(deploy.validate_token(raw), timeout=20)
-        logger.info("token ok user=%s @%s admin_id=%s", u.id, identity.username, u.id)
     except TokenError as e:
-        await replace_message(msg, t_invalid(str(e)))
+        _active.discard(u.id)
+        await state.update_data(deploying=False)
+        await progress_msg.edit_text(friendly_error(e), reply_markup=after_error_kb())
         await state.set_state(DeployStates.waiting_token)
         return
     except Exception as e:  # noqa: BLE001
-        logger.exception("token fail")
-        await replace_message(msg, t_invalid(str(e)[:200]))
-        await state.set_state(DeployStates.waiting_token)
+        _active.discard(u.id)
+        await state.update_data(deploying=False)
+        logger.exception("token")
+        await progress_msg.edit_text(friendly_error(e), reply_markup=after_error_kb())
         return
-
-    await state.set_state(None)
-    await state.update_data(deploying=True, subscription_id=sub.id)
-    await replace_message(msg, t_deploying(identity.username))
-    _active.add(u.id)
 
     asyncio.create_task(
         _bg_deploy(
             bot=message.bot,
             chat_id=message.chat.id,
-            mid=msg.message_id,
+            mid=progress_msg.message_id,
             tg_id=u.id,
             db_uid=db_user.id,
             sub_id=sub.id,
             token=raw,
             identity=identity,
             deploy=deploy,
+            billing=billing,
             settings=settings,
             state=state,
         )
@@ -346,13 +361,7 @@ async def on_token(
 
 
 @router.message(F.text.regexp(TOKEN_RE))
-async def on_token_free(
-    message: Message,
-    state: FSMContext,
-    billing: BillingService,
-    deploy: DeploymentEngine,
-    settings: Settings,
-) -> None:
+async def on_token_any(message: Message, state: FSMContext, billing: BillingService, deploy: DeploymentEngine, settings: Settings) -> None:
     if await state.get_state() == DeployStates.waiting_token.state:
         return
     await state.set_state(DeployStates.waiting_token)
@@ -370,6 +379,7 @@ async def _bg_deploy(
     token: str,
     identity,
     deploy: DeploymentEngine,
+    billing: BillingService,
     settings: Settings,
     state: FSMContext,
 ) -> None:
@@ -378,38 +388,39 @@ async def _bg_deploy(
             await bot.edit_message_text(text, chat_id=chat_id, message_id=mid, reply_markup=kb)
         except Exception:  # noqa: BLE001
             try:
-                await bot.send_message(chat_id, text, reply_markup=kb or _menu(settings, tg_id))
+                await bot.send_message(chat_id, text, reply_markup=kb)
             except Exception:  # noqa: BLE001
                 pass
 
+    # Map internal steps → premium stages
     async def progress(step: str) -> None:
-        await edit(t_progress(identity.username, step))
+        s = step.lower()
+        if "fayl" in s or "1/4" in s or "copy" in s:
+            await edit(deploy_progress(2, "Preparing database…"))
+        elif "sozlama" in s or "admin" in s or "2/4" in s or "config" in s:
+            await edit(deploy_progress(3, "Writing configuration…"))
+        elif "python" in s or "3/4" in s or "runtime" in s:
+            await edit(deploy_progress(4, "Starting deployment…"))
+        elif "start" in s or "4/4" in s or "health" in s:
+            await edit(deploy_progress(5, "Health check…"))
+        else:
+            await edit(deploy_progress(4, step[:40]))
 
     try:
+        await edit(deploy_progress(1, "Token validated"))
         dep_id = await deploy.deploy_for_user(
-            db_uid,
-            sub_id,
-            token,
-            identity,
-            progress,
-            owner_telegram_id=tg_id,
+            db_uid, sub_id, token, identity, progress, owner_telegram_id=tg_id
         )
+        panel = await billing.get_panel(tg_id)
+        sub = panel.get("subscription")
         await edit(
-            t_ready(identity.username, settings.subscription_days, owner_id=tg_id),
-            control_kb(),
+            deploy_done(identity.username, settings.subscription_days, _exp_str(sub)),
+            bot_actions_kb(dep_id),
         )
-        try:
-            await bot.send_message(
-                chat_id,
-                f"#{dep_id} · boshqaruv paneli",
-                reply_markup=control_kb(),
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        logger.info("DEPLOY OK user=%s dep=%s @%s ADMIN_IDS=%s", tg_id, dep_id, identity.username, tg_id)
+        logger.info("DEPLOY OK user=%s dep=%s", tg_id, dep_id)
     except Exception as e:  # noqa: BLE001
         logger.exception("DEPLOY FAIL user=%s", tg_id)
-        await edit(t_failed(str(e)))
+        await edit(friendly_error(e), after_error_kb())
     finally:
         _active.discard(tg_id)
         try:
@@ -418,122 +429,189 @@ async def _bg_deploy(
             pass
 
 
-# ── user panel ─────────────────────────────────────────
+# ── My Bots ────────────────────────────────────────────
 
-async def _send_status(message: Message, state: FSMContext, billing: BillingService, settings: Settings, uid: int) -> None:
-    p = await billing.get_panel(uid)
-    dep, sub = p.get("deployment"), p.get("subscription")
-    if not dep:
-        await show(message.bot, message.chat.id, state, t_no_bot(), _menu(settings, uid))
-        return
-    await show(
-        message.bot,
-        message.chat.id,
-        state,
-        t_status(
-            dep.bot_username,
-            dep.status,
-            p.get("days_left"),
-            sub.status if sub else None,
-            dep.last_error,
-            owner_id=uid,
-        ),
-        control_kb(),
-    )
-
-
-@router.message(Command("status", "mybot"))
-@router.message(F.text.in_({"📊 Status", "📊 Mening botim", "🎛 Boshqaruv"}))
-async def cmd_status(message: Message, state: FSMContext, billing: BillingService, settings: Settings) -> None:
-    await safe_delete_message(message)
-    u = message.from_user
-    if not u:
-        return
-    await _send_status(message, state, billing, settings, u.id)
-
-
-async def _ctl(
+@router.message(Command("bots", "mybots", "status"))
+@router.message(F.text.in_({"🤖 My Bots", "📊 Status", "🎛 Boshqaruv"}))
+@router.callback_query(F.data.startswith("ux:bots"))
+async def ux_bots(
     event: Message | CallbackQuery,
+    state: FSMContext,
+    billing: BillingService,
+    settings: Settings,
+    deploy: DeploymentEngine,
+) -> None:
+    if isinstance(event, CallbackQuery):
+        await safe_cb(event)
+        msg, u = event.message, event.from_user
+    else:
+        await safe_delete_message(event)
+        msg, u = event, event.from_user
+    if not msg or not u:
+        return
+    panel = await billing.get_panel(u.id)
+    dep = panel.get("deployment")
+    if not dep:
+        await show(
+            msg.bot,
+            msg.chat.id,
+            state,
+            "<b>My Bots</b>\n\nNo bots yet.\nCreate your first deployment.",
+            intro_kb(payments_on=settings.payments_enabled),
+        )
+        return
+    await _show_bot_card(msg, state, billing, deploy, settings, u.id, dep.id, engine=deploy)
+
+
+async def _show_bot_card(
+    msg: Message,
     state: FSMContext,
     billing: BillingService,
     deploy: DeploymentEngine,
     settings: Settings,
-    action: str,
+    uid: int,
+    dep_id: int,
+    engine: DeploymentEngine | None = None,
 ) -> None:
-    if isinstance(event, CallbackQuery):
-        await safe_cb(event)
-        message, u = event.message, event.from_user
-    else:
-        await safe_delete_message(event)
-        message, u = event, event.from_user
-    if not message or not u:
+    panel = await billing.get_panel(uid)
+    dep = panel.get("deployment")
+    if not dep or dep.id != dep_id:
+        dep = await billing.get_deployment(dep_id)
+    if not dep or dep.status == "deleted":
+        await show(
+            msg.bot,
+            msg.chat.id,
+            state,
+            "This bot is no longer available.",
+            intro_kb(payments_on=settings.payments_enabled),
+        )
         return
-    dep = (await billing.get_panel(u.id)).get("deployment")
-    if not dep:
-        await show(message.bot, message.chat.id, state, t_no_bot(), _menu(settings, u.id))
+    eng = engine or deploy
+    metrics = eng.metrics(dep.id, dep.project_path, dep.process_pid, dep.slug)
+    sub = panel.get("subscription")
+    days = panel.get("days_left")
+    if days is None and sub and sub.expires_at:
+        exp = as_utc(sub.expires_at)
+        if exp:
+            days = max(0, int((exp - datetime.now(timezone.utc)).total_seconds() // 86400))
+
+    text = bot_card(
+        username=dep.bot_username,
+        status=dep.status,
+        days_left=days,
+        expires=_exp_str(sub) if sub else None,
+        cpu=metrics["cpu"],
+        ram=metrics["ram"],
+        db_size=metrics["db_size"],
+        last_backup=metrics["last_backup"],
+    )
+    await show(msg.bot, msg.chat.id, state, text, bot_actions_kb(dep.id))
+
+
+@router.callback_query(F.data.startswith("bot:view:"))
+async def bot_view(
+    cb: CallbackQuery,
+    state: FSMContext,
+    billing: BillingService,
+    deploy: DeploymentEngine,
+    settings: Settings,
+) -> None:
+    await safe_cb(cb)
+    if not cb.message or not cb.from_user:
         return
+    dep_id = int(cb.data.split(":")[-1])
+    panel = await billing.get_panel(cb.from_user.id)
+    dep = panel.get("deployment")
+    if not dep or dep.id != dep_id:
+        await cb.message.answer("You can only manage your own bot.")
+        return
+    await _show_bot_card(cb.message, state, billing, deploy, settings, cb.from_user.id, dep_id, engine=deploy)
+
+
+@router.callback_query(F.data.startswith("bot:"))
+async def bot_actions(
+    cb: CallbackQuery,
+    state: FSMContext,
+    billing: BillingService,
+    deploy: DeploymentEngine,
+    settings: Settings,
+) -> None:
+    await safe_cb(cb)
+    if not cb.message or not cb.from_user:
+        return
+    parts = (cb.data or "").split(":")
+    if len(parts) < 3:
+        return
+    action, dep_id_s = parts[1], parts[2]
+    dep_id = int(dep_id_s)
+    panel = await billing.get_panel(cb.from_user.id)
+    dep = panel.get("deployment")
+    if not dep or dep.id != dep_id:
+        await cb.message.answer("Access denied.")
+        return
+
+    if action == "delask":
+        await cb.message.edit_text(
+            delete_warning(dep.bot_username),
+            reply_markup=confirm_kb(f"bot:delok:{dep_id}", f"bot:view:{dep_id}"),
+        )
+        return
+
     try:
-        if action == "restart":
-            await show(message.bot, message.chat.id, state, "⏳ Restart…", _menu(settings, u.id))
-            await deploy.restart(dep.id)
-            await show(message.bot, message.chat.id, state, "✅ Restart qilindi", control_kb())
+        if action == "start":
+            if dep.status == "suspended":
+                await cb.message.answer("Bot is suspended. Renew your subscription first.", reply_markup=sub_kb(payments_on=settings.payments_enabled))
+                return
+            await deploy.start(dep_id)
+            note = "Bot started."
         elif action == "stop":
-            await deploy.stop(dep.id)
-            await show(message.bot, message.chat.id, state, "⏹ To'xtatildi", control_kb())
-        elif action == "start":
-            await deploy.start(dep.id)
-            await show(message.bot, message.chat.id, state, "▶️ Ishga tushdi", control_kb())
-        elif action == "logs":
-            text = await deploy.read_logs(dep.id, 30)
-            safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            await show(
-                message.bot,
-                message.chat.id,
-                state,
-                f"<pre>{safe[-3000:]}</pre>" if safe else "Log bo'sh",
-                control_kb(),
-            )
+            await deploy.stop(dep_id)
+            note = "Bot stopped."
+        elif action == "restart":
+            await deploy.restart(dep_id)
+            note = "Bot restarted."
         elif action == "backup":
-            path = await deploy.backup(dep.id)
-            await show(
-                message.bot,
-                message.chat.id,
-                state,
-                f"💾 Backup: <code>{path.name}</code>",
-                control_kb(),
+            path = await deploy.backup(dep_id)
+            note = f"Backup saved: <code>{path.name}</code>"
+        elif action == "logs":
+            text = await deploy.read_logs(dep_id, 25)
+            safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            await cb.message.answer(f"<pre>{safe[-2500:]}</pre>" if safe else "No logs yet.")
+            return
+        elif action == "delok":
+            await deploy.purge(dep_id)
+            await cb.message.edit_text(
+                "<b>Bot deleted</b>\n\nAll data has been permanently removed.",
+                reply_markup=intro_kb(payments_on=settings.payments_enabled),
             )
+            return
+        else:
+            return
+        await cb.message.answer(f"✅ {note}")
+        await _show_bot_card(cb.message, state, billing, deploy, settings, cb.from_user.id, dep_id, engine=deploy)
     except Exception as e:  # noqa: BLE001
-        await show(message.bot, message.chat.id, state, f"❌ {e}", _menu(settings, u.id))
+        logger.exception("bot action")
+        await cb.message.answer(friendly_error(e), reply_markup=after_error_kb())
 
 
-@router.message(Command("restart"))
-@router.message(F.text == "🔁 Restart")
-@router.callback_query(F.data == "ctl:restart")
-async def ctl_restart(e, state: FSMContext, billing: BillingService, deploy: DeploymentEngine, settings: Settings) -> None:
-    await _ctl(e, state, billing, deploy, settings, "restart")
+# ── Dashboard ──────────────────────────────────────────
 
-
-@router.message(Command("stop", "stopbot"))
-@router.message(F.text == "⏹ Stop")
-@router.callback_query(F.data == "ctl:stop")
-async def ctl_stop(e, state: FSMContext, billing: BillingService, deploy: DeploymentEngine, settings: Settings) -> None:
-    await _ctl(e, state, billing, deploy, settings, "stop")
-
-
-@router.message(Command("startbot"))
-@router.message(F.text == "▶️ Start")
-@router.callback_query(F.data == "ctl:start")
-async def ctl_start(e, state: FSMContext, billing: BillingService, deploy: DeploymentEngine, settings: Settings) -> None:
-    await _ctl(e, state, billing, deploy, settings, "start")
-
-
-@router.message(Command("logs"))
-@router.message(F.text.in_({"🧾 Log", "🧾 Loglar"}))
-@router.callback_query(F.data == "ctl:logs")
-async def ctl_logs(e, state: FSMContext, billing: BillingService, deploy: DeploymentEngine, settings: Settings) -> None:
-    await _ctl(e, state, billing, deploy, settings, "logs")
-
-
-@router.callback_query(F.data == "ctl:backup")
-async def ctl_backup(e, state: FSMContext, billing: BillingService, deploy: DeploymentEngine, settings: Settings) -> None:
-    await _ctl(e, state, billing, deploy, settings, "backup")
+@router.message(Command("dashboard"))
+@router.message(F.text == "📊 Dashboard")
+async def ux_dashboard(message: Message, state: FSMContext, billing: BillingService, settings: Settings) -> None:
+    u = message.from_user
+    if not u:
+        return
+    await safe_delete_message(message)
+    panel = await billing.get_panel(u.id)
+    dep = panel.get("deployment")
+    sub = panel.get("subscription")
+    stats = {
+        "bots": 1 if dep else 0,
+        "running": 1 if dep and dep.status == "running" else 0,
+        "stopped": 1 if dep and dep.status == "stopped" else 0,
+        "suspended": 1 if dep and dep.status == "suspended" else 0,
+        "sub_status": sub.status if sub else "none",
+        "days_left": panel.get("days_left") if panel.get("days_left") is not None else "—",
+    }
+    await show(message.bot, message.chat.id, state, dashboard(stats), _menu(settings, u.id))

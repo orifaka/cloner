@@ -584,12 +584,75 @@ LOG_LEVEL=INFO
         async with self.sf() as s:
             dep = await s.get(Deployment, deployment_id)
             if not dep or not dep.project_path:
-                raise RuntimeError("Deployment yo'q")
+                raise RuntimeError("Bot not found")
             src, slug = Path(dep.project_path), dep.slug
         dest = self.settings.backups_dir / f"{slug}_{utcnow().strftime('%Y%m%d_%H%M%S')}"
         dest.mkdir(parents=True, exist_ok=True)
         if (src / "storage").exists():
-            shutil.copytree(src / "storage", dest / "storage")
+            target = dest / "storage"
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+            shutil.copytree(src / "storage", target)
         if (src / ".env").exists():
             shutil.copy2(src / ".env", dest / ".env")
         return dest
+
+    def metrics(self, deployment_id: int, project_path: Optional[str], pid: Optional[int], slug: str) -> dict:
+        """CPU/RAM/DB size/last backup for UX cards."""
+        cpu, ram = "—", "—"
+        if pid:
+            try:
+                import psutil
+
+                if psutil.pid_exists(pid):
+                    p = psutil.Process(pid)
+                    cpu = f"{p.cpu_percent(interval=0.1):.0f}%"
+                    ram = f"{p.memory_info().rss / (1024 * 1024):.0f} MB"
+            except Exception:  # noqa: BLE001
+                pass
+        db_size = "—"
+        if project_path:
+            db = Path(project_path) / "storage" / "mafia.db"
+            if db.exists():
+                mb = db.stat().st_size / (1024 * 1024)
+                db_size = f"{mb:.2f} MB" if mb >= 0.01 else f"{db.stat().st_size / 1024:.0f} KB"
+        last_backup = "Never"
+        try:
+            matches = sorted(self.settings.backups_dir.glob(f"{slug}_*"), reverse=True)
+            if matches:
+                last_backup = matches[0].name.split("_", 1)[-1][:15]
+        except Exception:  # noqa: BLE001
+            pass
+        return {"cpu": cpu, "ram": ram, "db_size": db_size, "last_backup": last_backup}
+
+    async def purge(self, deployment_id: int) -> None:
+        """Permanent delete: stop process, wipe project dir & backups, mark deleted."""
+        async with self.sf() as s:
+            dep = await s.get(Deployment, deployment_id)
+            if not dep:
+                return
+            pid = dep.process_pid
+            project = Path(dep.project_path) if dep.project_path else None
+            slug = dep.slug
+        if pid:
+            await asyncio.to_thread(self._kill_pid, pid)
+        if project and project.exists():
+            shutil.rmtree(project, ignore_errors=True)
+        try:
+            for b in self.settings.backups_dir.glob(f"{slug}_*"):
+                if b.is_dir():
+                    shutil.rmtree(b, ignore_errors=True)
+                else:
+                    b.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+        async with self.sf() as s:
+            dep = await s.get(Deployment, deployment_id)
+            if dep:
+                dep.status = "deleted"
+                dep.process_pid = None
+                dep.bot_token_encrypted = None
+                dep.deleted_at = utcnow()
+                dep.project_path = None
+                await s.commit()
+        logger.info("purged deployment id=%s slug=%s", deployment_id, slug)

@@ -29,7 +29,9 @@ class Settings(BaseSettings):
 
     subscription_price_stars: int = Field(default=300, alias="SUBSCRIPTION_PRICE_STARS")
     subscription_days: int = Field(default=30, alias="SUBSCRIPTION_DAYS")
-    grace_period_hours: int = Field(default=24, alias="GRACE_PERIOD_HOURS")
+    # Immediate suspend on expiry; permanent purge after this many days
+    grace_period_days: int = Field(default=7, alias="GRACE_PERIOD_DAYS")
+    grace_period_hours: int = Field(default=168, alias="GRACE_PERIOD_HOURS")  # legacy alias (7d)
     payments_enabled: bool = Field(default=False, alias="PAYMENTS_ENABLED")
 
     template_path: str = Field(default=str(ROOT_DIR / "template" / "mafia-bot"), alias="TEMPLATE_PATH")
