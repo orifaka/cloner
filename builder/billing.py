@@ -30,9 +30,15 @@ def as_utc(dt: Optional[datetime]) -> Optional[datetime]:
 
 
 class BillingService:
-    def __init__(self, settings: Settings, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        session_factory: async_sessionmaker[AsyncSession],
+        store: Any = None,
+    ) -> None:
         self.settings = settings
         self.sf = session_factory
+        self.store = store
 
     def _ref_code(self, telegram_id: int) -> str:
         return f"r{telegram_id}"
@@ -94,28 +100,56 @@ class BillingService:
         user.credit_stars = int(user.credit_stars or 0) + disc
         logger.info("referral applied user=%s by=%s credit=%s", user.telegram_id, ref.telegram_id, disc)
 
-    def price_for_user(
+    async def base_price(self) -> int:
+        if self.store:
+            try:
+                return await self.store.price_stars()
+            except Exception:  # noqa: BLE001
+                pass
+        return self.settings.subscription_price_stars
+
+    async def promo_discount(self) -> tuple[bool, int]:
+        if self.store:
+            try:
+                cfg = await self.store.promo_cfg()
+                return bool(cfg["enabled"]), int(cfg["discount"])
+            except Exception:  # noqa: BLE001
+                pass
+        return self.settings.promo_enabled, self.settings.promo_discount_stars
+
+    async def payments_enabled(self) -> bool:
+        if self.store:
+            try:
+                return await self.store.payments_on()
+            except Exception:  # noqa: BLE001
+                pass
+        return self.settings.payments_enabled
+
+    async def price_for_user(
         self,
         user: Optional[User] = None,
         *,
         days_left: Optional[int] = None,
     ) -> tuple[int, list[str]]:
         """Return final stars price and human labels for discounts."""
-        base = self.settings.subscription_price_stars
+        base = await self.base_price()
         price = base
         tags: list[str] = []
-        if self.settings.promo_enabled and self.settings.promo_discount_stars > 0:
-            off = self.settings.promo_discount_stars
-            price = max(50, price - off)
-            tags.append(f"🔥 Promo −{off}")
+        promo_on, promo_off = await self.promo_discount()
+        if promo_on and promo_off > 0:
+            price = max(50, price - promo_off)
+            tags.append(f"🔥 Promo −{promo_off}")
         # New user 24h flash
         if user and user.created_at:
             created = as_utc(user.created_at) or user.created_at
-            age_h = (utcnow() - created).total_seconds() / 3600 if created.tzinfo else 999
+            try:
+                age_h = (utcnow() - created).total_seconds() / 3600
+            except Exception:  # noqa: BLE001
+                age_h = 999
             if age_h <= float(self.settings.new_user_hours) and self.settings.new_user_discount > 0:
                 off = self.settings.new_user_discount
                 price = max(50, price - off)
-                tags.append(f"⚡ 24s offer −{off}")
+                tags.append(f"⚡ 24s −{off}")
         # Keep offer near expiry
         if days_left is not None and days_left <= self.settings.keep_offer_days and days_left >= 0:
             if self.settings.keep_offer_discount > 0:
@@ -134,7 +168,7 @@ class BillingService:
         panel = await self.get_panel(telegram_id)
         async with self.sf() as s:
             u = (await s.execute(select(User).where(User.telegram_id == telegram_id))).scalar_one_or_none()
-            return self.price_for_user(u, days_left=panel.get("days_left"))
+            return await self.price_for_user(u, days_left=panel.get("days_left"))
 
     async def payment_history(self, telegram_id: int, limit: int = 15) -> list[dict[str, Any]]:
         async with self.sf() as s:
@@ -283,7 +317,7 @@ class BillingService:
                 exp = as_utc(sub_tmp.expires_at)
                 if exp:
                     days_left = max(0, int((exp - utcnow()).total_seconds() // 86400))
-            amount, _tags = self.price_for_user(u, days_left=days_left)
+            amount, _tags = await self.price_for_user(u, days_left=days_left)
             sub = (
                 await s.execute(
                     select(Subscription)

@@ -63,6 +63,7 @@ _active: set[int] = set()
 
 class DeployStates(StatesGroup):
     waiting_token = State()
+    promo_code = State()
 
 
 def _admin(uid: int, s: Settings) -> bool:
@@ -189,6 +190,46 @@ async def ux_payments(message: Message, state: FSMContext, billing: BillingServi
     await safe_delete_message(message)
     rows = await billing.payment_history(u.id)
     await show(message.bot, message.chat.id, state, payments_history(rows), _menu(settings, u.id))
+
+
+@router.message(Command("promo", "promokod"))
+@router.message(F.text.in_({"🏷 Promokod", "🎟 Promokod"}))
+async def ux_promo_start(message: Message, state: FSMContext, settings: Settings) -> None:
+    u = message.from_user
+    await safe_delete_message(message)
+    await state.set_state(DeployStates.promo_code)
+    await show(
+        message.bot,
+        message.chat.id,
+        state,
+        "🏷 <b>Promokod</b>\n\nKodni yuboring.\nMasalan: <code>SALE50</code>\n\n/cancel",
+        _menu(settings, u.id if u else None),
+    )
+
+
+@router.message(DeployStates.promo_code, F.text)
+async def ux_promo_apply(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    store: "Store",
+) -> None:
+    from builder.store import Store as _S
+
+    u = message.from_user
+    if not u:
+        return
+    code = (message.text or "").strip()
+    if code.startswith("/"):
+        await state.clear()
+        await message.answer("Bekor.", reply_markup=_menu(settings, u.id))
+        return
+    try:
+        msg = await store.redeem_promo(u.id, code)
+        await state.clear()
+        await message.answer(msg, reply_markup=_menu(settings, u.id))
+    except Exception as e:  # noqa: BLE001
+        await message.answer(f"❌ {e}", reply_markup=_menu(settings, u.id))
 
 
 @router.message(F.text == "🎁 Referal")

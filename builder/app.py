@@ -78,7 +78,10 @@ async def run_bot() -> None:
 
     await init_db(settings)
     sf = get_session_factory(settings)
-    billing = BillingService(settings, sf)
+    from builder.store import Store
+
+    store = Store(settings, sf)
+    billing = BillingService(settings, sf, store=store)
     deploy = DeploymentEngine(settings, sf)
 
     bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -162,6 +165,7 @@ async def run_bot() -> None:
             settings=settings,
             billing=billing,
             deploy=deploy,
+            store=store,
             drop_pending_updates=True,
             allowed_updates=["message", "callback_query", "pre_checkout_query", "successful_payment"],
         )

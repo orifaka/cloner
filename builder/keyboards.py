@@ -9,9 +9,9 @@ def main_menu(*, is_admin: bool = False) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="✨ Bot ochish")],
         [KeyboardButton(text="🤖 Botlarim"), KeyboardButton(text="💎 Obuna")],
-        [KeyboardButton(text="🎁 Referal"), KeyboardButton(text="📋 To‘lovlar")],
-        [KeyboardButton(text="📊 Kabinet"), KeyboardButton(text="❓ FAQ")],
-        [KeyboardButton(text="⚙️ Sozlamalar"), KeyboardButton(text="💬 Support")],
+        [KeyboardButton(text="🎁 Referal"), KeyboardButton(text="🏷 Promokod")],
+        [KeyboardButton(text="📋 To‘lovlar"), KeyboardButton(text="📊 Kabinet")],
+        [KeyboardButton(text="❓ FAQ"), KeyboardButton(text="💬 Support")],
     ]
     if is_admin:
         rows.append([KeyboardButton(text="🛠 Admin")])
